@@ -42,15 +42,15 @@ app = typer.Typer(
 )
 
 dashboard_app = typer.Typer(help='TUI dashboard for VM management')
-app.add_typer(dashboard_app, name='dashboard')
+app.add_typer(dashboard_app, name='dashboard', rich_help_panel='Interactive')
 
 # Sub-typer for capsules
 capsule_app = typer.Typer(help='Manage capsules', invoke_without_command=True)
-app.add_typer(capsule_app, name='capsule')
+app.add_typer(capsule_app, name='capsule', rich_help_panel='Management')
 
 # Sub-typer for templates
 template_app = typer.Typer(help='Manage templates', invoke_without_command=True)
-app.add_typer(template_app, name='template')
+app.add_typer(template_app, name='template', rich_help_panel='Management')
 
 
 @app.callback(invoke_without_command=True)
@@ -139,7 +139,7 @@ def _menu_capsule_apply() -> None:
             apply_capsule_live(name, capsule)
 
 
-@app.command(name="menu")
+@app.command(name="menu", rich_help_panel="Interactive")
 def menu_cmd() -> None:
         '''Launch the TUI dashboard (live VM monitoring, keyboard shortcuts).'''
         from .tui import Dashboard
@@ -250,7 +250,7 @@ def _interactive_run() -> None:
             raise
 
 
-@app.command(name="create")
+@app.command(name="create", rich_help_panel="VM Lifecycle")
 def create_cmd(
     template: str = typer.Argument(..., help="Template name (e.g. headless, desktop)"),
     name: Optional[str] = typer.Option(None, "--name", "-n", help="VM name"),
@@ -314,7 +314,7 @@ def create_cmd(
     create_instance(template, name=name, capsule_names=capsule or None, overrides=overrides)
 
 
-@app.command(name="run")
+@app.command(name="run", rich_help_panel="VM Lifecycle")
 def run_cmd(
     template: str = typer.Argument(..., help="Template name (e.g. headless, desktop)"),
     command: list[str] = typer.Argument(None, help="Command to run inside the VM"),
@@ -354,43 +354,43 @@ def run_cmd(
     )
 
 
-@app.command(name="start")
+@app.command(name="start", rich_help_panel="VM Lifecycle")
 def start_cmd(name: str) -> None:
-    """Start a VM."""
+    """Start a VM (also: up)."""
     start_instance(name)
 
 
-@app.command(name="up")
+@app.command(name="up", hidden=True)
 def up_cmd(name: str) -> None:
     """Alias for 'start'."""
     start_instance(name)
 
 
-@app.command(name="stop")
+@app.command(name="stop", rich_help_panel="VM Lifecycle")
 def stop_cmd(name: str) -> None:
-    """Stop a VM. Ephemeral VMs are destroyed."""
+    """Stop a VM. Ephemeral VMs are destroyed (also: down)."""
     stop_instance(name)
 
 
-@app.command(name="down")
+@app.command(name="down", hidden=True)
 def down_cmd(name: str) -> None:
     """Alias for 'stop'."""
     stop_instance(name)
 
 
-@app.command(name="destroy")
+@app.command(name="destroy", rich_help_panel="VM Lifecycle")
 def destroy_cmd(
     name: str,
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
 ) -> None:
-    """Destroy a VM and shred its overlay."""
+    """Destroy a VM and shred its overlay (also: rm, del)."""
     if not force:
         if not typer.confirm(f"Destroy VM '{name}' and shred its disk?", default=False):
             raise typer.Abort()
     destroy_instance(name)
 
 
-@app.command(name="rm")
+@app.command(name="rm", hidden=True)
 def rm_cmd(
     name: str,
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
@@ -402,7 +402,7 @@ def rm_cmd(
     destroy_instance(name)
 
 
-@app.command(name="del")
+@app.command(name="del", hidden=True)
 def del_cmd(
     name: str,
     force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
@@ -414,13 +414,13 @@ def del_cmd(
     destroy_instance(name)
 
 
-@app.command(name="revive")
+@app.command(name="revive", rich_help_panel="VM Lifecycle")
 def revive_cmd(name: str) -> None:
     """Revive a stored VM (re-create libvirt domain from saved metadata)."""
     revive_instance(name)
 
 
-@app.command(name="ssh")
+@app.command(name="ssh", rich_help_panel="Access")
 def ssh_cmd(
     name: str,
     command: Optional[str] = typer.Argument(None, help="Optional command to run"),
@@ -429,25 +429,25 @@ def ssh_cmd(
     ssh_instance(name, command=command)
 
 
-@app.command(name="connect")
+@app.command(name="connect", rich_help_panel="Access")
 def connect_cmd(name: str) -> None:
     """Connect to a VM (SPICE for desktop, SSH for headless)."""
     connect_instance(name)
 
 
-@app.command(name="list")
+@app.command(name="list", rich_help_panel="VMs")
 def list_cmd() -> None:
-    """List all VMs."""
+    """List all VMs (also: ls)."""
     list_instances()
 
 
-@app.command(name="ls")
+@app.command(name="ls", hidden=True)
 def ls_cmd() -> None:
     """Alias for 'list'."""
     list_instances()
 
 
-@app.command(name="ps")
+@app.command(name="ps", rich_help_panel="VMs")
 def ps_cmd() -> None:
     """List running VMs (compact format)."""
     from rich.table import Table
@@ -472,13 +472,13 @@ def ps_cmd() -> None:
     console.print(table)
 
 
-@app.command(name="bootstrap")
+@app.command(name="bootstrap", rich_help_panel="Host")
 def bootstrap_cmd() -> None:
     """Bootstrap the host (networks, keys, base image)."""
     bootstrap_host()
 
 
-@app.command(name="init-base")
+@app.command(name="init-base", rich_help_panel="Host")
 def init_base_cmd(
     name: Optional[str] = typer.Option(None, "--name", "-n"),
     url: Optional[str] = typer.Option(None, "--url", "-u"),
@@ -487,7 +487,7 @@ def init_base_cmd(
     init_base(name, url)
 
 
-@app.command(name="doctor")
+@app.command(name="doctor", rich_help_panel="Host")
 def doctor_cmd(install: bool = False) -> None:
     """Check host dependencies. Use --install to attempt automatic fixes."""
     from latita.operations import doctor_install
@@ -503,7 +503,7 @@ def doctor_cmd(install: bool = False) -> None:
 
 @capsule_app.command(name="list")
 def capsule_list_cmd() -> None:
-    """List available capsules."""
+    """List available capsules (also: ls)."""
     all_caps = list_capsules()
     if not all_caps:
         console.print("No capsules found", style="yellow")
@@ -511,14 +511,10 @@ def capsule_list_cmd() -> None:
     caps_mod.format_capsule_table(all_caps)
 
 
-@capsule_app.command(name="ls")
+@capsule_app.command(name="ls", hidden=True)
 def capsule_ls_cmd() -> None:
     """Alias for 'capsule list'."""
-    all_caps = list_capsules()
-    if not all_caps:
-        console.print("No capsules found", style="yellow")
-        return
-    caps_mod.format_capsule_table(all_caps)
+    capsule_list_cmd()
 
 
 @capsule_app.command(name="apply")
@@ -536,7 +532,7 @@ def capsule_apply_cmd(
 
 @template_app.command(name="list")
 def template_list_cmd() -> None:
-    """List available .latita templates."""
+    """List available .latita templates (also: ls)."""
     templates = list_latita_templates()
     if not templates:
         console.print("No templates found", style="yellow")
@@ -568,7 +564,7 @@ def template_list_cmd() -> None:
     console.print(table)
 
 
-@template_app.command(name="ls")
+@template_app.command(name="ls", hidden=True)
 def template_ls_cmd() -> None:
     """Alias for 'template list'."""
     template_list_cmd()
