@@ -1,9 +1,9 @@
 profile: desktop
 os_family: fedora
-description: Minimal desktop VM with Openbox (lightweight WM)
+description: Minimal desktop with Openbox WM, lxpanel, and xterm
 base_image: fedora43-base.qcow2
 cpus: 2
-memory: 2048
+memory: 4096
 disk_size: 20G
 guest_user: dev
 passwordless_sudo: true
@@ -24,60 +24,51 @@ security:
 
 provision:
   packages:
+    - firefox
     - openssh-clients
     - openssh-server
     - spice-vdagent
     - xorg-x11-server-Xorg
+    - xorg-x11-xinit
     - xorg-x11-drv-qxl
     - mesa-dri-drivers
     - openbox
     - lxpanel
     - xterm
-    - brave-browser
   write_files:
-    - path: /etc/systemd/system/getty@tty1.service.d/override.conf
+    - path: /home/{guest_user}/.xinitrc
+      owner: "{guest_user}:{guest_user}"
+      permissions: "0644"
+      content: |
+        #!/bin/bash
+        lxpanel &
+        exec openbox-session
+    - path: /home/{guest_user}/.config/openbox/autostart
+      owner: "{guest_user}:{guest_user}"
+      permissions: "0644"
+      content: |
+        # Openbox autostart
+        xterm &
+    - path: /home/{guest_user}/.bash_profile
+      owner: "{guest_user}:{guest_user}"
+      permissions: "0644"
+      content: |
+        # Auto-start X on first virtual console
+        if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+            exec startx
+        fi
+    - path: /etc/systemd/system/getty@tty1.service.d/autologin.conf
       owner: root:root
       permissions: "0644"
       content: |
         [Service]
         ExecStart=
-        ExecStart=-/sbin/agetty --autologin {guest_user} --noclear %I $TERM
-    - path: /home/{guest_user}/.bash_profile
-      owner: "{guest_user}:{guest_user}"
-      permissions: "0644"
-      content: |
-        if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
-          exec startx
-        fi
-    - path: /home/{guest_user}/.xinitrc
-      owner: "{guest_user}:{guest_user}"
-      permissions: "0644"
-      content: |
-        lxpanel &
-        exec openbox-session
-    - path: /etc/X11/xorg.conf.d/10-video.conf
-      owner: root:root
-      permissions: "0644"
-      content: |
-        Section "Device"
-          Identifier "VideoDevice"
-          Driver "qxl"
-        EndSection
-    - path: /etc/yum.repos.d/brave-browser.repo
-      owner: root:root
-      permissions: "0644"
-      content: |
-        [brave-browser]
-        name=Brave Browser
-        enabled=1
-        baseurl=https://brave-browser-rpm-release.s3.brave.com/$basearch
-        gpgcheck=1
-        gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+        ExecStart=-/usr/sbin/agetty --autologin {guest_user} --noclear %I $TERM
   root_commands:
     - systemctl enable --now sshd
-    - systemctl set-default graphical.target
-    - systemctl enable spice-vdagentd || true
-    - rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc || true
-    - mkdir -p /home/{guest_user}/Downloads /home/{guest_user}/workspace /home/{guest_user}/.ssh
+    - mkdir -p /home/{guest_user}/.config/openbox /home/{guest_user}/Downloads /home/{guest_user}/workspace /home/{guest_user}/.ssh
     - chown -R {guest_user}:{guest_user} /home/{guest_user}
     - restorecon -RF /home/{guest_user} || true
+    - systemctl daemon-reload
+    - systemctl restart getty@tty1
+    - systemctl set-default graphical.target

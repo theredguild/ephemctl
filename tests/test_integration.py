@@ -23,6 +23,38 @@ from latita.utils import create_lab_key
 CIRROS_IMG = Path("/tmp/cirros.img")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_lingering_test_vms():
+    """Remove any test-* VMs left behind by interrupted previous runs.
+
+    Cleans up both at session start and session end.
+    """
+    def _clean():
+        for uri in ("qemu:///system", "qemu:///session"):
+            try:
+                cp = subprocess.run(
+                    ["virsh", "-c", uri, "list", "--all", "--name"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                for name in cp.stdout.splitlines():
+                    name = name.strip()
+                    if name.startswith("test-"):
+                        subprocess.run(
+                            ["virsh", "-c", uri, "destroy", name],
+                            capture_output=True, check=False, timeout=10,
+                        )
+                        subprocess.run(
+                            ["virsh", "-c", uri, "undefine", name, "--remove-all-storage"],
+                            capture_output=True, check=False, timeout=10,
+                        )
+            except Exception:
+                pass
+
+    _clean()
+    yield
+    _clean()
+
+
 @pytest.fixture
 def integration_cfg(tmp_path):
     """Provide an isolated session-mode config with a CirrOS base image."""
@@ -58,7 +90,7 @@ def integration_cfg(tmp_path):
                     check=False,
                 )
                 subprocess.run(
-                    ["virsh", "-c", cfg.libvirt_uri, "undefine", name],
+                    ["virsh", "-c", cfg.libvirt_uri, "undefine", name, "--remove-all-storage"],
                     capture_output=True,
                     check=False,
                 )

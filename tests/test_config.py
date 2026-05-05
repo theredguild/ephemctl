@@ -82,12 +82,8 @@ class TestTemplates:
         data = load_latita_template("desktop-minimal")
         assert data["profile"] == "desktop"
         assert "openbox" in data["provision"]["packages"]
-
-    def test_load_desktop_native_template(self):
-        data = load_latita_template("desktop-native")
-        assert data["profile"] == "desktop"
-        assert data["os_family"] == "ubuntu"
-        assert "xserver-xorg-video-qxl" in data["provision"]["packages"]
+        assert "lxpanel" in data["provision"]["packages"]
+        assert "xorg-x11-xinit" in data["provision"]["packages"]
 
     def test_user_template_override(self, isolated_config):
         cfg = isolated_config

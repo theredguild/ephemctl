@@ -48,14 +48,6 @@ provision:
         autologin-user-timeout=0
         user-session=xfce
         greeter-session=lightdm-gtk-greeter
-    - path: /etc/X11/xorg.conf.d/10-video.conf
-      owner: root:root
-      permissions: "0644"
-      content: |
-        Section "Device"
-          Identifier "VideoDevice"
-          Driver "qxl"
-        EndSection
   root_commands:
     - systemctl enable --now sshd
     - systemctl enable lightdm

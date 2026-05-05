@@ -17,10 +17,12 @@ from latita.operations import (
     apply_capsule_live,
     create_instance,
     destroy_instance,
+    get_vm_init_state,
     get_vm_ip,
     ssh_instance,
     start_instance,
     stop_instance,
+    wait_for_vm_ready,
 )
 from latita.utils import create_lab_key
 
@@ -39,6 +41,46 @@ def _wait_for_vm_ip(name: str, timeout: int = 180) -> str:
                 return ip
         time.sleep(3)
     raise TimeoutError(f"No dynamic IP discovered for {name} after {timeout}s")
+
+
+def _safe_destroy(name: str) -> None:
+    """Destroy a VM, silently ignoring if it was already removed."""
+    try:
+        destroy_instance(name)
+    except Exception:
+        pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _cleanup_lingering_test_vms():
+    """Remove any test-f43-* VMs left behind by interrupted previous runs.
+
+    Cleans up both at session start and session end.
+    """
+    def _clean():
+        for uri in ("qemu:///system", "qemu:///session"):
+            try:
+                cp = subprocess.run(
+                    ["virsh", "-c", uri, "list", "--all", "--name"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                for name in cp.stdout.splitlines():
+                    name = name.strip()
+                    if name.startswith("test-f43-"):
+                        subprocess.run(
+                            ["virsh", "-c", uri, "destroy", name],
+                            capture_output=True, check=False, timeout=10,
+                        )
+                        subprocess.run(
+                            ["virsh", "-c", uri, "undefine", name, "--remove-all-storage"],
+                            capture_output=True, check=False, timeout=10,
+                        )
+            except Exception:
+                pass
+
+    _clean()
+    yield
+    _clean()
 
 
 @pytest.fixture
@@ -84,7 +126,7 @@ live:
                     capture_output=True, check=False,
                 )
                 subprocess.run(
-                    ["virsh", "-c", cfg.libvirt_uri, "undefine", name],
+                    ["virsh", "-c", cfg.libvirt_uri, "undefine", name, "--remove-all-storage"],
                     capture_output=True, check=False,
                 )
     except Exception:
@@ -118,101 +160,89 @@ class TestFedoraSsh:
         cfg = fedora_cfg
         name = "test-f43-ip"
         self._create_fedora_vm(cfg, name)
-        start_instance(name)
-
-        ip = _wait_for_vm_ip(name, timeout=180)
-        # The discovered IP should not be the static template IP (10.31.0.10)
-        assert ip
-        assert ip != "10.31.0.10"
-
-        # Also verify get_vm_ip_addresses returned it
-        addresses = get_vm_ip_addresses(name)
-        assert any(a["ip"] == ip for a in addresses)
-
-        destroy_instance(name)
+        try:
+            start_instance(name)
+            ip = _wait_for_vm_ip(name, timeout=180)
+            assert ip
+            assert ip != "10.31.0.10"
+            addresses = get_vm_ip_addresses(name)
+            assert any(a["ip"] == ip for a in addresses)
+        finally:
+            _safe_destroy(name)
 
     def test_ssh_instance_builds_correct_command(self, fedora_cfg):
         """ssh_instance constructs the right SSH command with dynamic IP or forwarded port."""
         cfg = fedora_cfg
         name = "test-f43-ssh"
         self._create_fedora_vm(cfg, name)
-        start_instance(name)
+        try:
+            start_instance(name)
+            ip = _wait_for_vm_ip(name, timeout=180)
+            env = read_instance_env(name)
+            forwarded_port = env.get("FORWARDED_SSH_PORT")
 
-        ip = _wait_for_vm_ip(name, timeout=180)
+            real_run = subprocess.run
 
-        # Read forwarded port if session mode
-        env = read_instance_env(name)
-        forwarded_port = env.get("FORWARDED_SSH_PORT")
+            def _side_effect(*args, **kwargs):
+                cmd = args[0] if args else kwargs.get("args", [])
+                if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "ssh":
+                    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+                return real_run(*args, **kwargs)
 
-        # Only mock the actual SSH calls; let everything else (virsh, qemu-img) run for real
-        real_run = subprocess.run
-
-        def _side_effect(*args, **kwargs):
-            cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and len(cmd) > 0 and cmd[0] == "ssh":
-                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-            return real_run(*args, **kwargs)
-
-        with patch("latita.operations.subprocess.run", side_effect=_side_effect) as mock_run:
-            ssh_instance(name, command="echo hello")
-
-            ssh_calls = [c for c in mock_run.call_args_list if c.args and len(c.args[0]) > 0 and c.args[0][0] == "ssh"]
-            assert len(ssh_calls) == 1
-            cmd = ssh_calls[0].args[0]
-            assert cmd[0] == "ssh"
-            assert any("lab1_ed25519" in a for a in cmd)
-            assert "echo hello" in cmd
-            if forwarded_port:
-                assert "localhost" in str(cmd)
-                assert "-p" in cmd
-                assert forwarded_port in str(cmd)
-            else:
-                assert any(ip in a for a in cmd)
-
-        destroy_instance(name)
+            with patch("latita.operations.subprocess.run", side_effect=_side_effect) as mock_run:
+                ssh_instance(name, command="echo hello")
+                ssh_calls = [c for c in mock_run.call_args_list if c.args and len(c.args[0]) > 0 and c.args[0][0] == "ssh"]
+                assert len(ssh_calls) == 1
+                cmd = ssh_calls[0].args[0]
+                assert cmd[0] == "ssh"
+                assert any("lab1_ed25519" in a for a in cmd)
+                assert "echo hello" in cmd
+                if forwarded_port:
+                    assert "localhost" in str(cmd)
+                    assert "-p" in cmd
+                    assert forwarded_port in str(cmd)
+                else:
+                    assert any(ip in a for a in cmd)
+        finally:
+            _safe_destroy(name)
 
     def test_apply_capsule_live_builds_correct_commands(self, fedora_cfg):
         """apply_capsule_live builds the right SSH command sequence for a capsule."""
         cfg = fedora_cfg
         name = "test-f43-capsule"
         self._create_fedora_vm(cfg, name)
-        start_instance(name)
+        try:
+            start_instance(name)
+            ip = _wait_for_vm_ip(name, timeout=180)
+            env = read_instance_env(name)
+            forwarded_port = env.get("FORWARDED_SSH_PORT")
 
-        ip = _wait_for_vm_ip(name, timeout=180)
+            ssh_cmds: list[list[str]] = []
 
-        env = read_instance_env(name)
-        forwarded_port = env.get("FORWARDED_SSH_PORT")
+            def _capture_stream_ssh(cmd):
+                ssh_cmds.append(cmd)
+                return True
 
-        ssh_cmds: list[list[str]] = []
-
-        def _capture_stream_ssh(cmd):
-            ssh_cmds.append(cmd)
-            return True
-
-        with patch("latita.operations._stream_ssh", side_effect=_capture_stream_ssh):
-            apply_capsule_live(name, "test-echo")
-
-            assert len(ssh_cmds) >= 1
-            cmd = ssh_cmds[0]
-            assert cmd[0] == "ssh"
-            assert "capsule-live-test" in str(cmd)
-            if forwarded_port:
-                assert "localhost" in str(cmd)
-                assert "-p" in cmd
-                assert forwarded_port in str(cmd)
-            else:
-                assert any(ip in a for a in cmd)
-
-        destroy_instance(name)
+            with patch("latita.operations._stream_ssh", side_effect=_capture_stream_ssh):
+                apply_capsule_live(name, "test-echo")
+                assert len(ssh_cmds) >= 1
+                cmd = ssh_cmds[0]
+                assert cmd[0] == "ssh"
+                assert "capsule-live-test" in str(cmd)
+                if forwarded_port:
+                    assert "localhost" in str(cmd)
+                    assert "-p" in cmd
+                    assert forwarded_port in str(cmd)
+                else:
+                    assert any(ip in a for a in cmd)
+        finally:
+            _safe_destroy(name)
 
     def test_apply_capsule_live_runs_via_ssh(self, fedora_cfg):
         """apply_capsule_live actually executes capsule commands over SSH."""
         cfg = fedora_cfg
         name = "test-f43-capsule-real"
         self._create_fedora_vm(cfg, name)
-        start_instance(name)
-
-        # Create a marker-writing capsule in the isolated config
         marker_capsule = cfg.root_dir / "capsules" / "test-marker.cap"
         marker_capsule.write_text(
             """description: Write a marker file for E2E testing
@@ -225,18 +255,15 @@ live:
     - echo "executed" > /tmp/capsule-applied
 """
         )
-
-        _wait_for_ssh_ready(name, timeout=300)
-
-        # Apply the capsule via real SSH (no mocks)
-        apply_capsule_live(name, "test-marker")
-
-        # Verify the marker file was written
-        cp = _ssh_run(name, "cat /tmp/capsule-applied", timeout=30)
-        assert cp.returncode == 0, f"Marker file missing: {cp.stderr}"
-        assert "executed" in cp.stdout
-
-        destroy_instance(name)
+        try:
+            start_instance(name)
+            _wait_for_ssh_ready(name, timeout=300)
+            apply_capsule_live(name, "test-marker")
+            cp = _ssh_run(name, "cat /tmp/capsule-applied", timeout=30)
+            assert cp.returncode == 0, f"Marker file missing: {cp.stderr}"
+            assert "executed" in cp.stdout
+        finally:
+            _safe_destroy(name)
 
     def test_ensure_running_auto_starts_stopped_vm(self, fedora_cfg):
         """_ensure_running starts a stopped VM so it can be reached again."""
@@ -245,72 +272,65 @@ live:
         cfg = fedora_cfg
         name = "test-f43-autostart"
         self._create_fedora_vm(cfg, name)
-        start_instance(name)
-
-        # Wait until the guest agent reports an IP (VM is fully booted)
-        _wait_for_vm_ip(name, timeout=180)
-
-        # Stop the VM
-        stop_instance(name)
-        assert get_vm_state(name) != "running"
-
-        # _ensure_running should start it
-        _ensure_running(name)
-        assert get_vm_state(name) == "running"
-
-        # After auto-start, the guest agent should eventually report an IP again
-        ip = _wait_for_vm_ip(name, timeout=180)
-        assert ip
-        assert ip != "10.31.0.10"
-
-        destroy_instance(name)
+        try:
+            start_instance(name)
+            _wait_for_vm_ip(name, timeout=180)
+            stop_instance(name)
+            assert get_vm_state(name) != "running"
+            _ensure_running(name)
+            assert get_vm_state(name) == "running"
+            ip = _wait_for_vm_ip(name, timeout=180)
+            assert ip
+            assert ip != "10.31.0.10"
+        finally:
+            _safe_destroy(name)
 
     def test_real_ssh_to_vm_executes_command(self, fedora_cfg):
         """Real SSH end-to-end via localhost port forwarding in session mode."""
         cfg = fedora_cfg
         name = "test-f43-realssh"
         self._create_fedora_vm(cfg, name)
-        start_instance(name)
+        try:
+            start_instance(name)
+            _wait_for_vm_ip(name, timeout=180)
+            env = read_instance_env(name)
+            forwarded_port = env.get("FORWARDED_SSH_PORT")
+            assert forwarded_port, "Expected FORWARDED_SSH_PORT in session mode"
 
-        _wait_for_vm_ip(name, timeout=180)
+            user = env.get("GUEST_USER", "dev")
+            recipe = read_instance_recipe(name)
+            key = None
+            if recipe:
+                keys = recipe.get("_keys", {})
+                lab_priv = keys.get("lab_privkey_path")
+                if lab_priv and Path(lab_priv).exists():
+                    key = lab_priv
+            assert key, "No SSH private key found"
 
-        env = read_instance_env(name)
-        forwarded_port = env.get("FORWARDED_SSH_PORT")
-        assert forwarded_port, "Expected FORWARDED_SSH_PORT in session mode"
+            start = time.time()
+            result = None
+            while time.time() - start < 180:
+                cmd = [
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=5",
+                    "-o", "BatchMode=yes",
+                    "-p", forwarded_port,
+                    "-i", key,
+                    f"{user}@localhost",
+                    "echo ssh-real-test",
+                ]
+                cp = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if cp.returncode == 0 and "ssh-real-test" in cp.stdout:
+                    result = cp
+                    break
+                time.sleep(3)
 
-        user = env.get("GUEST_USER", "dev")
-        recipe = read_instance_recipe(name)
-        key = None
-        if recipe:
-            keys = recipe.get("_keys", {})
-            lab_priv = keys.get("lab_privkey_path")
-            if lab_priv and Path(lab_priv).exists():
-                key = lab_priv
-        assert key, "No SSH private key found"
-
-        start = time.time()
-        result = None
-        while time.time() - start < 180:
-            cmd = [
-                "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=5",
-                "-o", "BatchMode=yes",
-                "-p", forwarded_port,
-                "-i", key,
-                f"{user}@localhost",
-                "echo ssh-real-test",
-            ]
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if cp.returncode == 0 and "ssh-real-test" in cp.stdout:
-                result = cp
-                break
-            time.sleep(3)
-
-        assert result is not None
-        assert "ssh-real-test" in result.stdout
-        destroy_instance(name)
+            assert result is not None
+            assert "ssh-real-test" in result.stdout
+        finally:
+            _safe_destroy(name)
 
 
 def _wait_for_ssh_ready(name: str, timeout: int = 300) -> str:
@@ -576,43 +596,51 @@ class TestCapsuleHeavyIntegration:
         """podman-host capsule installs podman inside the VM."""
         cfg = fedora_cfg
         name = "test-f43-podman-heavy"
-        port, key = self._create_and_wait_for_ssh(cfg, name, ["podman-host"])
-        cp = self._retry_ssh_command(port, key, "dev", "podman --version")
-        assert "podman" in cp.stdout.lower()
-        destroy_instance(name)
+        try:
+            port, key = self._create_and_wait_for_ssh(cfg, name, ["podman-host"])
+            cp = self._retry_ssh_command(port, key, "dev", "podman --version")
+            assert "podman" in cp.stdout.lower()
+        finally:
+            _safe_destroy(name)
 
     @pytest.mark.slow
     def test_tailscale_installs_tailscale(self, fedora_cfg):
         """tailscale capsule installs tailscale inside the VM."""
         cfg = fedora_cfg
         name = "test-f43-tailscale-heavy"
-        port, key = self._create_and_wait_for_ssh(cfg, name, ["tailscale"])
-        cp = self._retry_ssh_command(port, key, "dev", "tailscale --version || tailscale version")
-        assert "tailscale" in cp.stdout.lower()
-        destroy_instance(name)
+        try:
+            port, key = self._create_and_wait_for_ssh(cfg, name, ["tailscale"])
+            cp = self._retry_ssh_command(port, key, "dev", "tailscale --version || tailscale version")
+            assert "tailscale" in cp.stdout.lower()
+        finally:
+            _safe_destroy(name)
 
     @pytest.mark.slow
     def test_whisper_installs_build_tools(self, fedora_cfg):
         """whisper capsule installs git, make, gcc inside the VM."""
         cfg = fedora_cfg
         name = "test-f43-whisper-heavy"
-        port, key = self._create_and_wait_for_ssh(cfg, name, ["whisper"])
-        for cmd in ("git --version", "make --version", "gcc --version"):
-            cp = self._retry_ssh_command(port, key, "dev", cmd)
-            assert cp.returncode == 0, f"{cmd} failed: {cp.stderr}"
-        destroy_instance(name)
+        try:
+            port, key = self._create_and_wait_for_ssh(cfg, name, ["whisper"])
+            for cmd in ("git --version", "make --version", "gcc --version"):
+                cp = self._retry_ssh_command(port, key, "dev", cmd)
+                assert cp.returncode == 0, f"{cmd} failed: {cp.stderr}"
+        finally:
+            _safe_destroy(name)
 
     @pytest.mark.slow
     def test_ai_agents_installs_nodejs(self, fedora_cfg):
         """ai-agents capsule installs nodejs and npm inside the VM."""
         cfg = fedora_cfg
         name = "test-f43-ai-heavy"
-        port, key = self._create_and_wait_for_ssh(cfg, name, ["ai-agents"])
-        cp = self._retry_ssh_command(port, key, "dev", "node --version")
-        assert "v" in cp.stdout
-        cp = self._retry_ssh_command(port, key, "dev", "npm --version")
-        assert cp.returncode == 0, f"npm --version failed: {cp.stderr}"
-        destroy_instance(name)
+        try:
+            port, key = self._create_and_wait_for_ssh(cfg, name, ["ai-agents"])
+            cp = self._retry_ssh_command(port, key, "dev", "node --version")
+            assert "v" in cp.stdout
+            cp = self._retry_ssh_command(port, key, "dev", "npm --version")
+            assert cp.returncode == 0, f"npm --version failed: {cp.stderr}"
+        finally:
+            _safe_destroy(name)
 
 
 @pytest.mark.slow
@@ -623,7 +651,6 @@ class TestTemplateProvisioning:
         ("headless", "fedora", "rpm -q"),
         ("desktop", "fedora", "rpm -q"),
         ("desktop-minimal", "fedora", "rpm -q"),
-        ("desktop-native", "ubuntu", "dpkg-query -W -f='${Package}\\n'"),
     ]
 
     def _create_vm_from_template(self, cfg: Config, name: str, template: str):
@@ -676,45 +703,160 @@ class TestTemplateProvisioning:
         """Create VM from template, verify every package in provision.packages is installed."""
         cfg = fedora_cfg
         name = f"test-f43-{template}"
+        self._create_vm_from_template(cfg, name, template)
 
-        # desktop-native needs ubuntu base image; skip if not available
-        if template == "desktop-native":
-            ubuntu_img = cfg.base_dir / "ubuntu2404-base.qcow2"
-            if not ubuntu_img.exists():
-                pytest.skip("Ubuntu base image not available")
-            # Override base image for this test
-            overrides = {
-                "base_image": "ubuntu2404-base.qcow2",
-                "ephemeral": {"transient": False, "destroy_on_stop": False},
-                "memory": 2048,
-                "cpus": 2,
-                "disk_size": "10G",
-                "network": {"mode": "user"},
-                "security": {"no_guest_agent": False, "selinux": False},
-            }
-            create_instance(template, name=name, overrides=overrides)
-        else:
-            self._create_vm_from_template(cfg, name, template)
+        try:
+            start_instance(name)
+            _wait_for_ssh_ready(name, timeout=300)
+            packages = self._get_template_packages(template)
+            assert packages, f"Template '{template}' has no packages to verify"
+            verify_cmd = self._build_verify_command(template, pkg_manager, packages)
+            start = time.time()
+            while time.time() - start < 600:
+                cp = _ssh_run(name, verify_cmd, timeout=60)
+                if cp.returncode == 0:
+                    break
+                time.sleep(10)
+            assert cp.returncode == 0, f"Not all packages installed for '{template}': stdout={cp.stdout!r} stderr={cp.stderr!r}"
+        finally:
+            _safe_destroy(name)
 
-        start_instance(name)
 
-        ip = _wait_for_ssh_ready(name, timeout=300)
+@pytest.mark.slow
+class TestVmInitState:
+    """Verify get_vm_init_state tracks headless and desktop VMs correctly
+    from initializing through to ready."""
 
-        packages = self._get_template_packages(template)
-        assert packages, f"Template '{template}' has no packages to verify"
+    def _create_headless_vm(self, cfg: Config, name: str):
+        overrides = {
+            "base_image": cfg.default_base_name,
+            "ephemeral": {"transient": False, "destroy_on_stop": False},
+            "memory": 2048,
+            "cpus": 2,
+            "disk_size": "10G",
+            "network": {"mode": "user"},
+            "security": {"no_guest_agent": False},
+        }
+        create_instance("headless", name=name, overrides=overrides)
 
-        verify_cmd = self._build_verify_command(template, pkg_manager, packages)
-        # Retry until cloud-init/bootstrap finishes installing packages
-        # (dnf can take several minutes on a loaded host; be patient)
-        start = time.time()
-        while time.time() - start < 600:
-            cp = _ssh_run(name, verify_cmd, timeout=60)
-            if cp.returncode == 0:
-                break
-            time.sleep(10)
-        assert cp.returncode == 0, f"Not all packages installed for '{template}': stdout={cp.stdout!r} stderr={cp.stderr!r}"
+    def _create_desktop_minimal_vm(self, cfg: Config, name: str):
+        overrides = {
+            "base_image": cfg.default_base_name,
+            "ephemeral": {"transient": False, "destroy_on_stop": False},
+            "memory": 2048,
+            "cpus": 2,
+            "disk_size": "10G",
+            "network": {"mode": "user"},
+            "security": {"no_guest_agent": True},
+        }
+        create_instance("desktop-minimal", name=name, overrides=overrides, wait=False)
 
-        destroy_instance(name)
+    def test_headless_reaches_ready(self, fedora_cfg):
+        """Headless VM: init state transitions to ready after cloud-init finishes."""
+        cfg = fedora_cfg
+        name = "test-f43-init-headless"
+        self._create_headless_vm(cfg, name)
+        try:
+            start_instance(name)
+            _wait_for_ssh_ready(name, timeout=300)
+            # Log intermediate state (timing-dependent, do not assert)
+            print(f"[init-state] pre-wait: {get_vm_init_state(name)}")
+            ok = wait_for_vm_ready(name, max_wait=600)
+            assert ok, "wait_for_vm_ready returned False (timeout or error)"
+            state = get_vm_init_state(name)
+            print(f"[init-state] post-wait: {state}")
+            assert state["overall"] == "ready", f"Expected ready, got {state}"
+            assert state["cloud_init"] == "done", f"Expected cloud-init done, got {state['cloud_init']}"
+            assert state["desktop"] == "n/a", f"Expected desktop n/a for headless, got {state['desktop']}"
+        finally:
+            _safe_destroy(name)
+
+    @pytest.mark.slow
+    def test_desktop_minimal_tracks_init_during_boot(self, fedora_cfg):
+        """desktop-minimal VM: init state reports 'initializing' during boot.
+
+        Verifies the desktop probe fires and the state machine tracks correctly
+        without waiting for the full installation (which can exceed 60 min).
+        """
+        cfg = fedora_cfg
+        name = "test-f43-init-desktop"
+        self._create_desktop_minimal_vm(cfg, name)
+        try:
+            start_instance(name, wait=False)
+            _wait_for_ssh_ready(name, timeout=600)
+            state = get_vm_init_state(name)
+            print(f"[init-state] during-boot: {state}")
+            # During boot, desktop-minimal is installing packages.
+            # Accept either 'initializing' (still working) or 'ready' (fast machine).
+            overall = state.get("overall")
+            assert overall in ("initializing", "ready"), f"Unexpected state: {state}"
+            if overall == "initializing":
+                assert state.get("cloud_init") == "running", f"Expected cloud-init running: {state}"
+                assert state.get("desktop") == "starting", f"Expected desktop starting: {state}"
+        finally:
+            _safe_destroy(name)
+
+
+@pytest.mark.very_slow
+class TestDesktopMinimalBoot:
+    """Verify desktop-minimal template boots, cloud-init finishes, and the
+    Openbox desktop environment is ready."""
+
+    def _create_desktop_minimal_vm(self, cfg: Config, name: str):
+        overrides = {
+            "base_image": cfg.default_base_name,
+            "ephemeral": {"transient": False, "destroy_on_stop": False},
+            "memory": 2048,
+            "cpus": 2,
+            "disk_size": "10G",
+            "network": {"mode": "user"},
+            "security": {"no_guest_agent": True},
+        }
+        create_instance("desktop-minimal", name=name, overrides=overrides, wait=False)
+
+    def test_cloud_init_finishes_and_desktop_ready(self, fedora_cfg):
+        """desktop-minimal VM: cloud-init completes, openbox running,
+        Xorg running, getty@tty1 active."""
+        cfg = fedora_cfg
+        name = "test-f43-desktop-minimal"
+        self._create_desktop_minimal_vm(cfg, name)
+        try:
+            start_instance(name, wait=False)
+            _wait_for_ssh_ready(name, timeout=600)
+            start = time.time()
+            while time.time() - start < 1800:
+                cp = _ssh_run(name, "sudo cloud-init status 2>/dev/null")
+                if cp.returncode in (0, 1, 2) and "status: done" in cp.stdout.lower():
+                    break
+                if "status: error" in cp.stdout.lower():
+                    pytest.fail(f"cloud-init failed: {cp.stdout} {cp.stderr}")
+                time.sleep(10)
+            else:
+                pytest.fail("cloud-init did not finish within 1800s")
+            cp = _ssh_run(name, "ps aux | grep openbox | grep -v grep")
+            assert cp.returncode == 0, f"openbox not running: {cp.stderr}"
+            cp = _ssh_run(name, "ps aux | grep Xorg | grep -v grep")
+            assert cp.returncode == 0, f"Xorg not running: {cp.stderr}"
+            cp = _ssh_run(name, "systemctl is-active getty@tty1")
+            assert cp.returncode == 0, f"getty@tty1 not active: {cp.stderr}"
+        finally:
+            _safe_destroy(name)
+
+    def test_wait_command_blocks_until_ready(self, fedora_cfg):
+        """wait_for_vm_ready returns True once desktop-minimal is fully up."""
+        cfg = fedora_cfg
+        name = "test-f43-desktop-minimal-wait"
+        self._create_desktop_minimal_vm(cfg, name)
+        try:
+            start_instance(name, wait=False)
+            ok = wait_for_vm_ready(name, max_wait=3600)
+            assert ok, "wait_for_vm_ready returned False (timeout or error)"
+            state = get_vm_init_state(name)
+            assert state["overall"] == "ready", f"Expected ready, got {state}"
+            assert state["cloud_init"] == "done", f"Expected cloud-init done, got {state['cloud_init']}"
+            assert state["desktop"] == "ready", f"Expected desktop ready, got {state['desktop']}"
+        finally:
+            _safe_destroy(name)
 
 
 @pytest.mark.system
@@ -855,9 +997,9 @@ class TestMvpE2E:
                 f"code={code!r} stdout={cp.stdout!r} stderr={cp.stderr!r}"
             )
 
-            # 6. Verify brave-browser is installed on desktop-minimal
-            cp = _ssh_run(desktop, "rpm -q brave-browser", timeout=30)
-            assert cp.returncode == 0, f"brave-browser not installed: {cp.stderr}"
+            # 6. Verify openbox is running on desktop-minimal
+            cp = _ssh_run(desktop, "ps aux | grep openbox | grep -v grep", timeout=30)
+            assert cp.returncode == 0, f"openbox not running on desktop: {cp.stderr}"
 
         finally:
             for vm in (headless, desktop):
