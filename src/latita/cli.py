@@ -6,7 +6,7 @@ from typing import Any, Optional
 import typer
 
 from . import capsules as caps_mod
-from .config import get_config, list_capsules, list_latita_templates, load_latita_template, load_project_config, clear_project_config, write_yaml
+from .config import get_config, list_capsules, list_latita_templates, load_latita_template, load_project_config, clear_project_config, load_root_config, clear_root_config, write_yaml
 from .operations import (
     apply_capsule_live,
     bootstrap_host,
@@ -14,6 +14,7 @@ from .operations import (
     create_instance,
     destroy_instance,
     doctor,
+    get_vm_init_state,
     init_base,
     list_instances,
     revive_instance,
@@ -22,6 +23,7 @@ from .operations import (
     ssh_instance,
     start_instance,
     stop_instance,
+    wait_for_vm_ready,
 )
 from .prompts import (
     interactive_create_simple,
@@ -51,6 +53,10 @@ app.add_typer(capsule_app, name='capsule', rich_help_panel='Management')
 # Sub-typer for templates
 template_app = typer.Typer(help='Manage templates', invoke_without_command=True)
 app.add_typer(template_app, name='template', rich_help_panel='Management')
+
+# Sub-typer for config
+config_app = typer.Typer(help='Manage latita configuration')
+app.add_typer(config_app, name='config', rich_help_panel='Management')
 
 
 @app.callback(invoke_without_command=True)
@@ -211,6 +217,7 @@ def _interactive_create(level: str = "simple") -> None:
             name=recipe.get("name"),
             capsule_names=recipe.get("capsules", []),
             overrides=recipe,
+            wait=False,
         )
     except typer.BadParameter as exc:
         if "base image not found" in str(exc):
@@ -220,6 +227,7 @@ def _interactive_create(level: str = "simple") -> None:
                     name=recipe.get("name"),
                     capsule_names=recipe.get("capsules", []),
                     overrides=recipe,
+                    wait=False,
                 )
         else:
             raise
@@ -269,6 +277,7 @@ def create_cmd(
     restrict_network: bool = typer.Option(False, "--restrict-network", help="Restrict outbound network"),
     advanced: bool = typer.Option(False, "--advanced", help="Interactive advanced mode"),
     full: bool = typer.Option(False, "--full", help="Interactive full wizard mode"),
+    no_wait: bool = typer.Option(False, "--no-wait", help="Return immediately without waiting for initialization"),
 ) -> None:
     '''Create a VM from a template.
 
@@ -311,7 +320,7 @@ def create_cmd(
         from .operations import _deep_update
         _deep_update(overrides, project_cfg)
 
-    create_instance(template, name=name, capsule_names=capsule or None, overrides=overrides)
+    create_instance(template, name=name, capsule_names=capsule or None, overrides=overrides, wait=not no_wait)
 
 
 @app.command(name="run", rich_help_panel="VM Lifecycle")
@@ -355,9 +364,12 @@ def run_cmd(
 
 
 @app.command(name="start", rich_help_panel="VM Lifecycle")
-def start_cmd(name: str) -> None:
+def start_cmd(
+    name: str,
+    no_wait: bool = typer.Option(False, "--no-wait", help="Return immediately without waiting for initialization"),
+) -> None:
     """Start a VM (also: up)."""
-    start_instance(name)
+    start_instance(name, wait=not no_wait)
 
 
 @app.command(name="up", hidden=True)
@@ -388,6 +400,33 @@ def destroy_cmd(
         if not typer.confirm(f"Destroy VM '{name}' and shred its disk?", default=False):
             raise typer.Abort()
     destroy_instance(name)
+
+
+@app.command(name="orphan-clean", rich_help_panel="VM Lifecycle")
+def orphan_clean_cmd(
+    force: bool = typer.Option(False, "--force", "-f", help="Clean up without asking"),
+) -> None:
+    """Find and destroy orphaned latita VMs (disk path exists but no metadata)."""
+    from .operations import scan_instances
+    entries = scan_instances()
+    orphans = [e for e in entries if e.get("source") == "orphaned"]
+    if not orphans:
+        console.print("No orphaned VMs found.", style="green")
+        return
+    console.print(f"[yellow]Found {len(orphans)} orphaned VM(s):[/yellow]")
+    for e in orphans:
+        console.print(f"  - {e['name']}  (status: {e.get('status', '?')})")
+    if not force:
+        if not typer.confirm(f"\nDestroy all {len(orphans)} orphaned VM(s)? This cannot be undone.", default=False):
+            raise typer.Abort()
+    for e in orphans:
+        name = e["name"]
+        console.print(f"  Destroying {name}...", style="dim")
+        try:
+            destroy_instance(name)
+        except Exception as ex:
+            console.print(f"  [red]Failed to destroy {name}: {ex}[/red]")
+    console.print(f"[green]Cleaned up {len(orphans)} orphaned VM(s).[/green]")
 
 
 @app.command(name="rm", hidden=True)
@@ -433,6 +472,29 @@ def ssh_cmd(
 def connect_cmd(name: str) -> None:
     """Connect to a VM (SPICE for desktop, SSH for headless)."""
     connect_instance(name)
+
+
+@app.command(name="status", rich_help_panel="VMs")
+def status_cmd(name: str) -> None:
+    """Show VM state and initialization progress."""
+    from .libvirt import get_vm_state
+    state = get_vm_state(name)
+    init = get_vm_init_state(name)
+    console.print(f"[bold]{name}[/bold]")
+    console.print(f"  State      : {state or 'unknown'}")
+    console.print(f"  Cloud-init : {init['cloud_init']}")
+    if init['desktop'] != 'n/a':
+        console.print(f"  Desktop    : {init['desktop']}")
+    overall_color = "green" if init['overall'] == "ready" else "red" if init['overall'] == "failed" else "yellow"
+    console.print(f"  Overall    : [{overall_color}]{init['overall']}[/{overall_color}]")
+
+
+@app.command(name="wait", rich_help_panel="VMs")
+def wait_cmd(name: str) -> None:
+    """Block until a VM finishes initialization."""
+    ok = wait_for_vm_ready(name)
+    if not ok:
+        raise typer.Exit(1)
 
 
 @app.command(name="list", rich_help_panel="VMs")
@@ -590,6 +652,72 @@ def template_generate_cmd(
         raise typer.Exit()
     write_yaml(output, recipe)
     console.print(f'[green]Template written to {output}[/green]')
+
+
+# ---------------------------------------------------------------------------
+# Config commands
+# ---------------------------------------------------------------------------
+
+@config_app.command(name='show')
+def config_show_cmd() -> None:
+    """Show current latita configuration."""
+    cfg = get_config()
+    console.print('[bold]Latita configuration[/bold]\n')
+    console.print(f'  Root directory: {cfg.root_dir}')
+    console.print(f'  Libvirt URI:  {cfg.libvirt_uri}')
+    if cfg.is_session:
+        console.print('  Mode:         [green]Session[/green] (unprivileged, isolated per VM)')
+    else:
+        console.print('  Mode:         [yellow]System[/yellow] (privileged, shared NAT bridge)')
+    console.print(f'  Default base: {cfg.default_base_name}')
+    console.print(f'  Base images:  {cfg.base_dir}')
+    root_cfg = load_root_config(cfg.root_dir)
+    if root_cfg.get("libvirt_uri"):
+        console.print(f'\n  [dim]Mode override set in {cfg.root_dir}/.latita[/dim]')
+    console.print('\n[dim]Use "latita config set-mode session|system" to switch.[/dim]')
+    console.print('[dim]Or set LIBVIRT_DEFAULT_URI environment variable.[/dim]')
+
+
+@config_app.command(name='set-mode')
+def config_set_mode_cmd(
+    mode: str = typer.Argument(..., help="session or system"),
+) -> None:
+    """Switch between session and system libvirt mode."""
+    cfg = get_config()
+    mode = mode.lower().strip()
+    if mode not in ("session", "system"):
+        console.print(f"[red]Invalid mode '{mode}'. Use 'session' or 'system'.[/red]")
+        raise typer.Exit(1)
+
+    uri = f"qemu:///{mode}"
+    root_cfg = load_root_config(cfg.root_dir)
+    root_cfg["libvirt_uri"] = uri
+    config_path = cfg.root_dir / ".latita"
+    write_yaml(config_path, root_cfg)
+    clear_root_config()
+
+    console.print(f"[green]Mode set to {mode} ({uri})[/green]")
+    console.print(f"Config saved to {config_path}")
+    console.print("[yellow]Restart latita for the change to take effect.[/yellow]")
+
+
+@config_app.command(name='reset-mode')
+def config_reset_mode_cmd() -> None:
+    """Remove the persisted mode override and go back to auto-detection."""
+    cfg = get_config()
+    config_path = cfg.root_dir / ".latita"
+    if config_path.exists():
+        root_cfg = load_root_config(cfg.root_dir)
+        root_cfg.pop("libvirt_uri", None)
+        if root_cfg:
+            write_yaml(config_path, root_cfg)
+        else:
+            config_path.unlink()
+        clear_root_config()
+        console.print("[green]Mode override removed. Auto-detection restored.[/green]")
+    else:
+        console.print("[yellow]No mode override found.[/yellow]")
+    console.print("[yellow]Restart latita for the change to take effect.[/yellow]")
 
 
 # ---------------------------------------------------------------------------

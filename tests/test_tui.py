@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from textual.containers import ScrollableContainer
+from textual.containers import ScrollableContainer, Vertical
 from textual.widgets import Button, DataTable, ListView, Select, Input, Checkbox, Static
 
 from latita.tui import (
@@ -467,19 +467,16 @@ class TestRunVMScreen:
                 await pilot.pause()
                 await app.push_screen(screen)
                 await pilot.pause()
-                assert screen.query_one("#profile", Select) is not None
-                assert screen.query_one("#name", Input) is not None
-                assert screen.query_one("#network_mode", Select) is not None
-                assert screen.query_one("#video_model", Select) is not None
-                assert screen.query_one("#command", Input) is not None
+                assert screen.query_one("#run-profile", Select) is not None
+                assert screen.query_one("#run-defaults", Static) is not None
                 assert screen.query_one("#run-warn", Static) is not None
-                assert screen.query_one("#btn-create", Button) is not None
+                assert screen.query_one("#btn-run", Button) is not None
                 assert screen.query_one("#btn-cancel", Button) is not None
                 await pilot.press("escape")
                 await pilot.press("q")
         _run_async(_test())
 
-    def test_submit_dismisses_with_recipe_and_command(self):
+    def test_submit_dismisses_with_recipe(self):
         screen = RunVMScreen()
         results = []
 
@@ -492,82 +489,24 @@ class TestRunVMScreen:
                 await pilot.pause()
                 await app.push_screen(screen, _cb)
                 await pilot.pause()
-                screen.query_one("#name", Input).value = "runvm"
-                screen.query_one("#command", Input).value = "uname -a"
                 screen.action_submit()
                 await pilot.pause()
                 assert len(results) == 1
                 assert results[0]["mode"] == "run"
-                assert results[0]["recipe"]["name"] == "runvm"
-                assert results[0]["recipe"]["command"] == "uname -a"
-                assert results[0]["recipe"]["network"]["mode"] == "nat"
+                assert results[0]["recipe"]["ephemeral"]["transient"] is True
                 await pilot.press("q")
         _run_async(_test())
 
-    def test_submit_isolated_network(self):
+    def test_defaults_update_on_template_change(self):
         screen = RunVMScreen()
-        results = []
-
-        def _cb(result):
-            results.append(result)
-
         async def _test():
             app = Dashboard()
             async with app.run_test() as pilot:
                 await pilot.pause()
-                await app.push_screen(screen, _cb)
+                await app.push_screen(screen)
                 await pilot.pause()
-                screen.query_one("#name", Input).value = "runvm"
-                screen.query_one("#network_mode", Select).value = "isolated"
-                screen.action_submit()
-                await pilot.pause()
-                assert len(results) == 1
-                assert results[0]["recipe"]["network"]["mode"] == "isolated"
-                await pilot.press("q")
-        _run_async(_test())
-
-    def test_submit_none_network(self):
-        screen = RunVMScreen()
-        results = []
-
-        def _cb(result):
-            results.append(result)
-
-        async def _test():
-            app = Dashboard()
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                await app.push_screen(screen, _cb)
-                await pilot.pause()
-                screen.query_one("#name", Input).value = "runvm"
-                screen.query_one("#network_mode", Select).value = "none"
-                screen.action_submit()
-                await pilot.pause()
-                assert len(results) == 1
-                assert results[0]["recipe"]["network"]["mode"] == "none"
-                await pilot.press("q")
-        _run_async(_test())
-
-    def test_submit_requires_name(self):
-        screen = RunVMScreen()
-        results = []
-
-        def _cb(result):
-            results.append(result)
-
-        async def _test():
-            app = Dashboard()
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                await app.push_screen(screen, _cb)
-                await pilot.pause()
-                # Clear the auto-suggested name
-                screen.query_one("#name", Input).value = ""
-                screen.action_submit()
-                await pilot.pause()
-                assert len(results) == 0
-                error = screen.query_one("#form-error", Static)
-                assert "required" in error._Static__content.lower()
+                defaults = screen.query_one("#run-defaults", Static)
+                assert "profile=" in str(defaults._Static__content)
                 await pilot.press("escape")
                 await pilot.press("q")
         _run_async(_test())

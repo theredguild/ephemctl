@@ -11,18 +11,18 @@ TypeToConfirmScreen { align: center middle; }
 
 /* Form screens (Create VM, Run VM, Apply Capsule) */
 .form-screen { align: center middle; }
-.form-box { width: 60; height: auto; background: #1e1e2e; border: solid #89b4fa; padding: 1 2; }
+.form-box { width: 90; height: auto; background: #1e1e2e; border: solid #89b4fa; padding: 1 2; }
 .form-title { color: #89b4fa; text-style: bold; text-align: center; }
 .form-error { color: #f38ba8; text-align: center; height: 1; }
 .form-warn { color: #f9e2af; text-align: center; }
 .form-hint { color: #7f849c; text-align: center; height: 1; }
-.form-buttons { layout: horizontal; height: auto; margin-top: 1; }
-.form-buttons Button { width: 1fr; padding: 0 1; height: 1; border: none; }
-
-/* Advanced section */
-#btn-advanced { width: 100%; margin-top: 1; }
-#advanced-fields { margin-top: 1; }
-.form-subtitle { color: #89b4fa; text-style: bold; margin-top: 1; }
+#form-body { layout: horizontal; }
+#form-left { width: 1fr; }
+.form-buttons { layout: horizontal; height: auto; margin-top: 1; align: left middle; }
+.form-buttons Button { width: auto; min-width: 16; padding: 0 2; height: 1; border: none; }
+.form-advanced-header { color: #89b4fa; text-style: bold; }
+#btn-advanced { }
+#form-right { width: 0; display: none; padding: 0 1; border-left: solid #313244; }
 
 /* Apply capsule */
 #cap-net-warn { color: #f38ba8; text-style: bold; text-align: center; height: 3; }
@@ -34,6 +34,20 @@ InfoScreen { align: center middle; }
 #info-scroll { height: 1fr; }
 #info-detail { height: auto; }
 #info-hint { color: #7f849c; text-align: center; margin-top: 1; }
+
+/* Logs screen */
+LogsScreen { align: center middle; }
+#logs-box { width: 80; height: auto; max-height: 30; background: #1e1e2e; border: solid #89b4fa; padding: 1 2; }
+#logs-title { color: #89b4fa; text-style: bold; text-align: center; }
+#logs-scroll { height: 1fr; max-height: 24; }
+#logs-content { color: #cdd6f4; }
+#logs-hint { color: #7f849c; text-align: center; margin-top: 1; }
+
+/* Base image picker */
+BaseImagePickerScreen { align: center middle; }
+#image-box { width: 60; height: auto; background: #1e1e2e; border: solid #89b4fa; padding: 1 2; }
+#image-title { color: #f9e2af; text-style: bold; text-align: center; }
+#image-hint2 { color: #7f849c; text-align: center; }
 
 /* Browser screens (Templates, Capsules) */
 BrowserScreen { layout: vertical; background: #1e1e2e; }
@@ -56,5 +70,15 @@ Screen { layout: vertical; background: #1e1e2e; }
 #vm-table:focus { border: solid #89b4fa; }
 #action-list { height: 1fr; border: solid #313244; }
 #action-list:focus { border: solid #89b4fa; }
+
+/* Group headers in action list */
+.group-header {
+    color: #89b4fa;
+    text-style: bold;
+    background: #1e1e2e;
+    height: 1;
+    padding: 0 1;
+}
+
 #hint-pane { height: 1; color: #7f849c; background: #0f0f1a; padding: 0 1; }
 #statusbar { dock: bottom; height: 1; color: #7f849c; background: #16161e; border-top: solid #313244; padding: 0 1; }

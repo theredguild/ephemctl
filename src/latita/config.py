@@ -52,7 +52,7 @@ def _auto_libvirt_uri() -> str:
             ['virsh', '-c', 'qemu:///system', 'list'],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=1,
         )
         if cp.returncode == 0:
             return 'qemu:///system'
@@ -135,9 +135,13 @@ class Config:
     @classmethod
     def default(cls) -> Config:
         root = resolve_root_dir()
+        root_cfg = load_root_config(root)
+        uri = root_cfg.get("libvirt_uri")
+        if not uri:
+            uri = _auto_libvirt_uri()
         return cls(
             root_dir=root,
-            libvirt_uri=_auto_libvirt_uri(),
+            libvirt_uri=uri,
             default_base_url="",
             default_base_name="fedora43-base.qcow2",
             net_name="mgmt-nogw",
@@ -213,6 +217,28 @@ def load_project_config(cwd: Path | None = None) -> dict[str, Any]:
 def clear_project_config() -> None:
     global _PROJECT_CONFIG
     _PROJECT_CONFIG = None
+
+
+_ROOT_CONFIG: dict[str, Any] | None = None
+
+
+def load_root_config(root: Path | None = None) -> dict[str, Any]:
+    """Load a .latita config file from the latita root directory."""
+    global _ROOT_CONFIG
+    if _ROOT_CONFIG is not None:
+        return _ROOT_CONFIG
+    r = root or resolve_root_dir()
+    p = r / ".latita"
+    if p.exists():
+        _ROOT_CONFIG = load_yaml(p)
+    else:
+        _ROOT_CONFIG = {}
+    return _ROOT_CONFIG
+
+
+def clear_root_config() -> None:
+    global _ROOT_CONFIG
+    _ROOT_CONFIG = None
 
 
 def write_yaml(path: Path, data: dict[str, Any]) -> None:

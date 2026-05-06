@@ -41,6 +41,9 @@ def _package_install_block(packages: list[str], package_manager: str = "dnf") ->
     ]
 
 
+import re
+
+
 class _SafeFormatDict(dict[str, str]):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -48,7 +51,11 @@ class _SafeFormatDict(dict[str, str]):
 
 def _format_value(value: Any, context: dict[str, str]) -> Any:
     if isinstance(value, str):
-        return value.format_map(_SafeFormatDict(context))
+        return re.sub(
+            r"\{(\w+)\}",
+            lambda m: context.get(m.group(1), m.group(0)),
+            value,
+        )
     if isinstance(value, list):
         return [_format_value(item, context) for item in value]
     if isinstance(value, dict):
@@ -102,30 +109,26 @@ def _render_cloud_config(config: dict[str, Any]) -> str:
     return "#cloud-config\n" + "\n".join(_yaml_lines(config)) + "\n"
 
 
-def _base_provision(profile: str, context: dict[str, str]) -> dict[str, Any]:
+def _base_provision(profile: str, context: dict[str, str], os_family: str = "fedora") -> dict[str, Any]:
     """Base provision fragment for a profile (headless or desktop)."""
     workspace_dir = context["workspace_dir"]
     home_dir = context["home_dir"]
     guest_user = context["guest_user"]
+    is_debian = os_family in ("ubuntu", "debian")
+    ssh_svc = "ssh" if is_debian else "sshd"
 
     if profile == "desktop":
         return {
             "packages": ["openssh-server"],
             "root_commands": [
-                "systemctl enable --now sshd",
-                f"mkdir -p {home_dir}/Downloads {workspace_dir} {home_dir}/.ssh",
-                f"chown -R {guest_user}:{guest_user} {home_dir}",
-                f"restorecon -RF {home_dir} || true",
+                f"systemctl enable --now {ssh_svc}",
             ],
         }
 
     return {
         "packages": ["openssh-server"],
         "root_commands": [
-            "systemctl enable --now sshd",
-            f"mkdir -p {workspace_dir}",
-            f"chown -R {guest_user}:{guest_user} {workspace_dir}",
-            f"restorecon -RF {workspace_dir} || true",
+            f"systemctl enable --now {ssh_svc}",
         ],
     }
 
@@ -167,6 +170,7 @@ def build_user_data(
     capsule_provisions: list[dict[str, Any]] | None = None,
     passwordless_sudo: bool = True,
     package_manager: str = "dnf",
+    os_family: str = "fedora",
 ) -> str:
     home_dir = f"/home/{guest_user}"
     context = {
@@ -181,9 +185,10 @@ def build_user_data(
         ),
     }
 
-    base = _base_provision(profile, context)
-    merged = _merge_provisions(base, provision or {}, *(capsule_provisions or []))
-    merged = _format_value(merged, context)
+    base = _base_provision(profile, context, os_family=os_family)
+    formatted_provision = _format_value(provision or {}, context) if provision else {}
+    formatted_capsules = [_format_value(c, context) for c in (capsule_provisions or [])]
+    merged = _merge_provisions(base, formatted_provision, *formatted_capsules)
 
     bootstrap_path = f"/root/bootstrap-{profile}.sh"
     write_files = list(merged.get("write_files", []))
@@ -197,9 +202,9 @@ def build_user_data(
     )
 
     config = {
-        "users": [_user_definition(profile, context, passwordless_sudo)],
+        "users": [_user_definition(profile, context, passwordless_sudo, os_family=os_family)],
         "ssh_pwauth": False,
-        "write_files": _format_value(write_files, context),
+        "write_files": write_files,
         "runcmd": [bootstrap_path],
     }
     return _render_cloud_config(config)
@@ -244,10 +249,12 @@ def _user_definition(
     profile: str,
     context: dict[str, str],
     passwordless_sudo: bool = True,
+    os_family: str = "fedora",
 ) -> dict[str, Any]:
+    is_debian = os_family in ("ubuntu", "debian")
     user = {
         "name": context["guest_user"],
-        "groups": ["wheel"],
+        "groups": ["sudo"] if is_debian else ["wheel"],
         "shell": "/bin/bash",
         "ssh_authorized_keys": [
             k for k in (context["host_pubkey"], context["lab_pubkey"]) if k

@@ -342,7 +342,7 @@ def build_recipe(
             profile=recipe["profile"],
             os_family=recipe["os_family"],
         )
-        recipe["_resolved_capsules"] = resolved
+        recipe["_resolved_capsules"] = [data for _, data in resolved]
         recipe["capsules"] = requested
     else:
         recipe["_resolved_capsules"] = []
@@ -508,9 +508,9 @@ def _discover_latest_fedora_url(url: str) -> str | None:
 
 
 def _maybe_download_base(base_image_name: str) -> bool:
-    """Check if a base image exists; if not and it's in BASE_IMAGES, prompt to download.
+    """Download a base image if it's in the catalog. No interactive prompts.
 
-    Returns True if the image is now available, False if the user declined or it's not in catalog.
+    Returns True if the image is now available, False if not in catalog or download failed.
     """
     cfg = get_config()
     base_img = cfg.base_dir / base_image_name
@@ -525,13 +525,12 @@ def _maybe_download_base(base_image_name: str) -> bool:
     if not info:
         return False
 
-    if typer.confirm(
-        f"Base image '{base_image_name}' not found. Download from catalog?",
-        default=True,
-    ):
+    try:
         _download_base(info["filename"], info["url"], discover=info.get("discover", False))
         return (cfg.base_dir / base_image_name).exists()
-    return False
+    except Exception as exc:
+        console.print(f"[red]Download failed: {exc}[/red]")
+        return False
 
 
 def _download_base(name: str, url: str, discover: bool = False) -> None:
@@ -628,6 +627,8 @@ def create_instance(
     name: str | None = None,
     capsule_names: list[str] | None = None,
     overrides: dict[str, Any] | None = None,
+    *,
+    wait: bool = True,
 ) -> None:
     cfg = get_config()
     validate_name(name or "")
@@ -641,7 +642,9 @@ def create_instance(
     validate_ip(recipe["network"]["mgmt_ip"])
 
     inst = cfg.inst_dir / recipe["name"]
-    if inst.exists():
+    pending_marker = inst / ".downloading"
+    creating_marker = inst / ".creating"
+    if inst.exists() and not pending_marker.exists() and not creating_marker.exists():
         raise typer.BadParameter(f"instance already exists: {inst}")
 
     base_img = cfg.base_dir / recipe["base_image"]
@@ -690,7 +693,7 @@ def create_instance(
     else:
         raise typer.BadParameter("network mode must be isolated, nat, direct, auto, or user")
 
-    inst.mkdir(parents=True)
+    inst.mkdir(parents=True, exist_ok=True)
     overlay = inst / f"{recipe['name']}.qcow2"
 
     # Pre-flight checks
@@ -705,6 +708,11 @@ def create_instance(
         console.print("[yellow]Rolling back instance directory...[/yellow]")
         _rollback_create(inst)
         raise
+
+    if wait:
+        wait_for_vm_ready(recipe["name"])
+    else:
+        console.print(f"\n[dim]VM created. Use `latita wait {recipe['name']}` or `latita status {recipe['name']}` to track initialization.[/dim]")
 
 
 def _rollback_create(inst: Path) -> None:
@@ -756,6 +764,7 @@ def _run_create(
         capsule_provisions=capsule_provisions,
         passwordless_sudo=recipe["passwordless_sudo"],
         package_manager=pkg_mgr,
+        os_family=recipe.get("os_family", "fedora"),
     )
 
     wan_mac = random_mac()
@@ -945,7 +954,7 @@ def _check_ephemeral_constraints(name: str) -> None:
             )
 
 
-def start_instance(name: str) -> None:
+def start_instance(name: str, *, wait: bool = True) -> None:
     validate_name(name)
     if not vm_exists(name):
         raise typer.BadParameter(f"VM not found in libvirt: {name}")
@@ -960,6 +969,8 @@ def start_instance(name: str) -> None:
         start_vm_libvirt(name)
     metadata.increment_run_count(name)
     console.print(f"Started {name}", style="green")
+    if wait:
+        wait_for_vm_ready(name)
 
 
 def pause_instance(name: str) -> None:
@@ -1014,8 +1025,9 @@ def stop_instance(name: str) -> None:
 def destroy_instance(name: str) -> None:
     validate_name(name)
     cfg = get_config()
+    inst = cfg.inst_dir / name
+
     if vm_exists(name):
-        # Capture expected errors (already stopped / transient domain)
         stop_vm_libvirt(name, capture=True)
         undefine_vm_libvirt(name, capture=True)
         if vm_exists(name):
@@ -1023,7 +1035,7 @@ def destroy_instance(name: str) -> None:
                 f"failed to undefine VM '{name}' in libvirt. "
                 "It may have snapshots, checkpoints, or a managed save image."
             )
-    inst = cfg.inst_dir / name
+
     if inst.exists():
         overlay = inst / f"{name}.qcow2"
         shred_file(overlay)
@@ -1034,6 +1046,7 @@ def destroy_instance(name: str) -> None:
                 f"[yellow]Could not remove {inst} (permission denied).[/yellow]\n"
                 f"Run: sudo rm -rf {inst}",
             )
+
     console.print(f"Destroyed {name}", style="green")
 
 
@@ -1051,7 +1064,6 @@ def run_instance(
     cfg = get_config()
     recipe = build_recipe(template_name, overrides=overrides, capsule_names=capsule_names)
 
-    # Force ephemeral settings
     recipe["ephemeral"]["transient"] = True
     recipe["ephemeral"]["destroy_on_stop"] = False
     if cfg.is_session:
@@ -1071,10 +1083,18 @@ def run_instance(
     net = recipe["network"]
     _ensure_host_networks(cfg, net["mode"], net.get("nat_network"))
 
-    # Use a temp overlay that will be deleted after
     import tempfile
-    with tempfile.TemporaryDirectory(prefix="latita-run-") as td:
-        overlay = Path(td) / f"{name}.qcow2"
+    td = tempfile.mkdtemp(prefix="latita-run-")
+    td_path = Path(td)
+
+    def _cleanup() -> None:
+        if vm_exists(name):
+            stop_vm_libvirt(name, capture=True)
+            undefine_vm_libvirt(name, capture=True)
+        shutil.rmtree(td_path, ignore_errors=True)
+
+    try:
+        overlay = td_path / f"{name}.qcow2"
         run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base_img), str(overlay)])
         run(["qemu-img", "resize", str(overlay), recipe["disk_size"]])
 
@@ -1101,23 +1121,23 @@ def run_instance(
             capsule_provisions=capsule_provisions,
             passwordless_sudo=recipe["passwordless_sudo"],
             package_manager=pkg_mgr,
+            os_family=recipe.get("os_family", "fedora"),
         )
 
         wan_mac = random_mac()
         net = recipe["network"]
 
-        ud_path = Path(td) / "user-data.yaml"
-        # Skip network-config in user mode (session SLIRP) — one NIC only.
+        ud_path = td_path / "user-data.yaml"
         if net["mode"] not in ("isolated", "none", "user"):
             net_cfg = build_network_config(wan_mac, random_mac(), net["mgmt_ip"], net["mgmt_prefix"])
-            nc_path = Path(td) / "network-config.yaml"
+            nc_path = td_path / "network-config.yaml"
             ud_path.write_text(user_data)
             nc_path.write_text(net_cfg)
         else:
             ud_path.write_text(user_data)
             nc_path = None
 
-        iso_path = Path(td) / "nocloud.iso"
+        iso_path = td_path / "nocloud.iso"
         _build_nocloud_iso(ud_path, nc_path, iso_path, instance_id=name)
 
         args = [
@@ -1171,17 +1191,19 @@ def run_instance(
         console.print(f"Running transient {name}...", style="cyan")
         virt_install(args)
 
-        # If a command was given, wait briefly for boot then exec via SSH?
-        # For now just let the user connect manually, or we can wait for shutdown
         if command:
             console.print(f"Transient VM started. Waiting for shutdown...", style="dim")
-            # Wait until domain disappears (transient auto-removes on shutdown)
             import time
             while vm_exists(name):
                 time.sleep(1)
         else:
             console.print(f"Transient VM {name} is running. Connect with: latita ssh {name}", style="green")
             console.print(f"It will disappear on shutdown.", style="dim")
+    except Exception:
+        _cleanup()
+        raise
+    else:
+        _cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -1456,15 +1478,15 @@ def apply_capsule_live(name: str, capsule_name: str) -> None:
             "_keys": {},
         }
 
-    capsule = capsules.load_capsule(capsule_name)
-    ok, reason = capsules.check_capsule_compatibility(
-        capsule,
-        profile=recipe.get("profile", ""),
-        os_family=recipe.get("os_family", ""),
-    )
-    if not ok:
-        console.print(f"[yellow]Capsule '{capsule_name}' incompatible: {reason}[/yellow]")
-        console.print("[yellow]You can still apply it manually via 'latita ssh {name}'[/yellow]")
+    # Resolve dependencies so they are applied in order before the requested capsule
+    try:
+        resolved = capsules.resolve_capsules(
+            [capsule_name],
+            profile=recipe.get("profile", ""),
+            os_family=recipe.get("os_family", ""),
+        )
+    except Exception as exc:
+        console.print(f"[yellow]Failed to resolve capsule dependencies: {exc}[/yellow]")
         return
 
     # Check network mode and warn if isolated
@@ -1479,21 +1501,6 @@ def apply_capsule_live(name: str, capsule_name: str) -> None:
             f"Capsules that download packages or images will fail.[/yellow]"
         )
 
-    # Re-apply guard
-    applied = read_applied_capsules(name)
-    if capsule_name in applied:
-        if not typer.confirm(
-            f"Capsule '{capsule_name}' was already applied to '{name}'. Re-apply (replace)?",
-            default=False,
-        ):
-            console.print(f"Skipped re-applying '{capsule_name}'.", style="yellow")
-            return
-
-    cmds = capsules.format_live_commands(capsule, recipe.get("guest_user", "dev"))
-    if not cmds:
-        console.print(f"Capsule '{capsule_name}' has no live commands", style="yellow")
-        return
-
     env = read_instance_env(name)
     forwarded_port = env.get("FORWARDED_SSH_PORT")
     if forwarded_port:
@@ -1506,8 +1513,6 @@ def apply_capsule_live(name: str, capsule_name: str) -> None:
         console.print(f"[yellow]Cannot resolve IP for {name}. Is the VM running?[/yellow]")
         console.print("[yellow]Try: latita start {name}[/yellow]")
         return
-
-    user = capsules.capsule_live_user(capsule, recipe.get("guest_user", "dev"))
 
     keys = recipe.get("_keys", {})
     key = None
@@ -1525,37 +1530,64 @@ def apply_capsule_live(name: str, capsule_name: str) -> None:
         console.print("[yellow]No SSH private key found. Cannot apply capsule remotely.[/yellow]")
         return
 
-    # Wait for SSH key auth to be ready (cloud-init race condition)
-    _wait_for_ssh_ready(ip, user, key, ssh_port)
+    applied = read_applied_capsules(name)
 
-    script = "\n".join(cmds)
-    ssh_cmd = [
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=5",
-        "-i", key,
-    ]
-    if ssh_port:
-        ssh_cmd.extend(["-p", str(ssh_port)])
-    ssh_cmd.extend([f"{user}@{ip}", f"bash -lc {shlex.quote(script)}"])
+    for cap_name, capsule in resolved:
+        ok, reason = capsules.check_capsule_compatibility(
+            capsule,
+            profile=recipe.get("profile", ""),
+            os_family=recipe.get("os_family", ""),
+        )
+        if not ok:
+            console.print(f"[yellow]Capsule '{cap_name}' incompatible: {reason}[/yellow]")
+            continue
 
-    console.print(f"Applying capsule '{capsule_name}' to {name} via SSH...", style="cyan")
-    success = _stream_ssh(ssh_cmd)
-    if not success:
-        console.print(f"[yellow]Capsule apply failed. Try debugging manually: latita ssh {name}[/yellow]")
-        return
+        # Re-apply guard
+        if cap_name in applied:
+            if not typer.confirm(
+                f"Capsule '{cap_name}' was already applied to '{name}'. Re-apply (replace)?",
+                default=False,
+            ):
+                console.print(f"Skipped re-applying '{cap_name}'.", style="yellow")
+                continue
 
-    console.print(f"[green]Capsule '{capsule_name}' applied successfully[/green]")
-    append_applied_capsule(name, capsule_name)
+        user = capsules.capsule_live_user(capsule, recipe.get("guest_user", "dev"))
+        cmds = capsules.format_live_commands(capsule, recipe.get("guest_user", "dev"))
+        if not cmds:
+            console.print(f"Capsule '{cap_name}' has no live commands", style="yellow")
+            continue
 
-    # Run verify command if defined
-    verify_cmd = capsules.capsule_verify_command(capsule)
-    if verify_cmd:
-        console.print(f"Verifying capsule '{capsule_name}'...", style="dim")
-        formatted_verify = capsules.format_verify_command(capsule, recipe.get("guest_user", "dev"))
-        v_ssh = ssh_cmd[:-1] + [f"bash -lc {shlex.quote(formatted_verify)}"]
-        _stream_ssh(v_ssh)
+        # Wait for SSH key auth to be ready (cloud-init race condition)
+        _wait_for_ssh_ready(ip, user, key, ssh_port)
+
+        script = "\n".join(cmds)
+        ssh_cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-i", key,
+        ]
+        if ssh_port:
+            ssh_cmd.extend(["-p", str(ssh_port)])
+        ssh_cmd.extend([f"{user}@{ip}", f"bash -lc {shlex.quote(script)}"])
+
+        console.print(f"Applying capsule '{cap_name}' to {name} via SSH...", style="cyan")
+        success = _stream_ssh(ssh_cmd)
+        if not success:
+            console.print(f"[yellow]Capsule apply failed. Try debugging manually: latita ssh {name}[/yellow]")
+            return
+
+        console.print(f"[green]Capsule '{cap_name}' applied successfully[/green]")
+        append_applied_capsule(name, cap_name)
+
+        # Run verify command if defined
+        verify_cmd = capsules.capsule_verify_command(capsule)
+        if verify_cmd:
+            console.print(f"Verifying capsule '{cap_name}'...", style="dim")
+            formatted_verify = capsules.format_verify_command(capsule, recipe.get("guest_user", "dev"))
+            v_ssh = ssh_cmd[:-1] + [f"bash -lc {shlex.quote(formatted_verify)}"]
+            _stream_ssh(v_ssh)
 
 
 def _stream_ssh(cmd: list[str]) -> bool:
@@ -1576,30 +1608,411 @@ def _stream_ssh(cmd: list[str]) -> bool:
     return proc.returncode == 0
 
 
+def _build_ssh_base(name: str) -> tuple[list[str], str, str] | None:
+    """Build the common SSH command prefix for a VM.
+
+    Returns (ssh_cmd_base, user, target) or None if the VM has no
+    reachable endpoint or no usable key.
+    """
+    env = read_instance_env(name)
+    recipe = read_instance_recipe(name)
+    forwarded_port = env.get("FORWARDED_SSH_PORT")
+    if forwarded_port:
+        target = "localhost"
+        ssh_cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+            "-p", str(forwarded_port),
+        ]
+    else:
+        target = get_vm_ip(name)
+        if not target:
+            target = env.get("MGMT_IP", "")
+        if not target:
+            return None
+        ssh_cmd = [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=5",
+            "-o", "BatchMode=yes",
+        ]
+
+    user = env.get("GUEST_USER", "dev")
+    if recipe:
+        user = recipe.get("guest_user", user)
+
+    keys = recipe.get("_keys", {}) if recipe else {}
+    key = None
+    for candidate in (
+        keys.get("lab_privkey_path"),
+        keys.get("host_pubkey_path", "").replace(".pub", ""),
+    ):
+        if candidate and Path(candidate).exists():
+            key = candidate
+            break
+    if not key:
+        for kname in ("id_ed25519", "id_ecdsa", "id_rsa"):
+            kp = Path.home() / ".ssh" / kname
+            if kp.exists():
+                key = str(kp)
+                break
+    if not key:
+        return None
+
+    ssh_cmd.extend(["-i", key])
+    return ssh_cmd, user, target
+
+
+def _ssh_run(name: str, command: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    """Run a single SSH command on a VM and return the result."""
+    base = _build_ssh_base(name)
+    if not base:
+        return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="no ssh base")
+    ssh_cmd, user, target = base
+    cmd = list(ssh_cmd)
+    cmd.extend([f"{user}@{target}", command])
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _probe_cloud_init_status(name: str, timeout: int = 15) -> str:
+    """Non-blocking check of cloud-init status inside the VM.
+
+    Returns one of: 'done', 'running', 'error', 'n/a'.
+    """
+    cp = _ssh_run(name, "sudo cloud-init status 2>/dev/null", timeout=timeout)
+    if cp.returncode not in (0, 1, 2):
+        return "n/a"
+    out = cp.stdout.lower()
+    if "status: done" in out:
+        return "done"
+    if "status: running" in out:
+        return "running"
+    if "status: error" in out:
+        return "error"
+    return "n/a"
+
+
+def fetch_vm_error_log(name: str) -> str:
+    """Collect diagnostic logs from a running VM via SSH.
+
+    Returns a string with cloud-init status, failed systemd units,
+    and recent error-level journal entries.  Also persists the log
+    to ``<instance_dir>/last-errors.log`` so it survives VM destruction.
+    """
+    from .metadata import error_log_path
+
+    if get_vm_state(name) != "running":
+        p = error_log_path(name)
+        if p.exists():
+            return p.read_text()
+        return "VM is not running — no logs available."
+
+    sections = []
+
+    cp = _ssh_run(name, "sudo cloud-init status --long 2>/dev/null", timeout=15)
+    sections.append(f"=== cloud-init status ===\n{cp.stdout.strip() or cp.stderr.strip() or '(no output)'}")
+
+    cp = _ssh_run(name, "sudo systemctl list-units --failed --no-legend 2>/dev/null", timeout=15)
+    sections.append(f"=== Failed systemd units ===\n{cp.stdout.strip() or '(none)'}")
+
+    cp = _ssh_run(name, "sudo journalctl -p err --since today -b -n 30 --no-pager 2>/dev/null", timeout=15)
+    sections.append(f"=== Recent errors (journalctl -p err) ===\n{cp.stdout.strip() or '(none)'}")
+
+    log_text = "\n\n".join(sections)
+    p = error_log_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(log_text)
+    p.chmod(0o600)
+    return log_text
+
+
+def _probe_desktop_readiness(name: str, timeout: int = 15) -> str:
+    """Check whether the desktop environment inside the VM is ready.
+
+    Returns one of: 'ready', 'starting', 'n/a'.
+    """
+    recipe = read_instance_recipe(name)
+    template_name = recipe.get("template_name", "") if recipe else ""
+    profile = recipe.get("profile", "") if recipe else ""
+
+    if profile != "desktop":
+        return "n/a"
+
+    # desktop-minimal uses autologin+startx, not a display manager
+    if template_name == "desktop-minimal":
+        cp = _ssh_run(
+            name,
+            "ps aux | grep -E 'openbox' | grep -v grep >/dev/null 2>&1",
+            timeout=timeout,
+        )
+        if cp.returncode == 0:
+            return "ready"
+        return "starting"
+
+    # Check graphical.target first (universal for display-manager desktops)
+    cp = _ssh_run(name, "systemctl is-active graphical.target 2>/dev/null", timeout=timeout)
+    if cp.returncode != 0:
+        return "starting"
+
+    # Template-specific checks    if template_name == "desktop":
+        cp = _ssh_run(name, "systemctl is-active lightdm 2>/dev/null", timeout=timeout)
+        if cp.returncode == 0:
+            return "ready"
+        return "starting"
+
+    # Unknown desktop template — graphical.target is the best we can do
+    return "ready"
+
+
+def get_vm_init_state(name: str) -> dict[str, str]:
+    """Return the initialization state of a VM (non-blocking).
+
+    Keys:
+      - cloud_init : 'done' | 'running' | 'error' | 'n/a'
+      - desktop    : 'ready' | 'starting' | 'n/a'
+      - overall    : 'ready' | 'initializing' | 'failed' | 'n/a'
+    """
+    state = get_vm_state(name)
+    if state != "running":
+        return {"cloud_init": "n/a", "desktop": "n/a", "overall": "n/a"}
+
+    base = _build_ssh_base(name)
+    if not base:
+        return {"cloud_init": "n/a", "desktop": "n/a", "overall": "initializing"}
+
+    cloud = _probe_cloud_init_status(name)
+    desktop = _probe_desktop_readiness(name)
+
+    if cloud == "error":
+        overall = "failed"
+    elif cloud == "done" and desktop in ("ready", "n/a"):
+        overall = "ready"
+    elif cloud in ("running", "done") and desktop == "starting":
+        overall = "initializing"
+    elif cloud == "n/a" and desktop == "n/a":
+        overall = "n/a"
+    else:
+        overall = "initializing"
+
+    return {"cloud_init": cloud, "desktop": desktop, "overall": overall}
+
+
+def wait_for_vm_ready(name: str, max_wait: float | None = None) -> bool:
+    """Block until a VM finishes cloud-init and (for desktops) the GUI is ready.
+
+    Prints progress messages.  Returns True when ready, False on timeout or
+    cloud-init error.
+    """
+    import time
+
+    validate_name(name)
+    recipe = read_instance_recipe(name)
+    profile = recipe.get("profile", "") if recipe else ""
+    is_desktop = profile == "desktop"
+
+    if max_wait is None:
+        max_wait = 480.0 if is_desktop else 300.0
+
+    console.print(f"[cyan]Waiting for {name} to be ready...[/cyan]")
+
+    # Stage 1: SSH authentication ready
+    base = _build_ssh_base(name)
+    if not base:
+        console.print(f"[yellow]Cannot determine SSH endpoint for {name}.[/yellow]")
+        return False
+    ssh_cmd, user, target = base
+
+    start = time.monotonic()
+    attempt = 0
+    while time.monotonic() - start < max_wait:
+        attempt += 1
+        cp = subprocess.run(
+            ssh_cmd + [f"{user}@{target}", "true"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if cp.returncode == 0:
+            if attempt > 1:
+                console.print(f"  [green]SSH ready after {attempt} attempts[/green]")
+            break
+        time.sleep(2.0)
+    else:
+        console.print(f"[red]SSH not ready for {name} after {int(max_wait)}s.[/red]")
+        return False
+
+    # Stage 2: cloud-init status (polling, non-blocking)
+    elapsed = int(time.monotonic() - start)
+    remaining = max_wait - elapsed
+    if remaining <= 0:
+        console.print(f"[red]Timeout waiting for {name}.[/red]")
+        return False
+
+    console.print(f"  [dim]Waiting for cloud-init (up to {int(remaining)}s)...[/dim]")
+    ci_start = time.monotonic()
+    while time.monotonic() - ci_start < remaining:
+        cp = subprocess.run(
+            ssh_cmd + [f"{user}@{target}", "sudo cloud-init status 2>/dev/null"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if cp.returncode not in (0, 1, 2):
+            break
+        out = cp.stdout.lower()
+        if "status: done" in out:
+            console.print(f"  [green]Cloud-init finished[/green]")
+            elapsed = int(time.monotonic() - start)
+            remaining = max_wait - elapsed
+            break
+        if "status: error" in out:
+            console.print(f"  [red]Cloud-init finished with errors:[/red]")
+            console.print(f"  {cp.stdout.strip()}")
+            return False
+        time.sleep(5.0)
+    else:
+        console.print(f"  [yellow]Cloud-init did not finish within {int(remaining)}s[/yellow]")
+        # Not a hard failure — the VM is still usable via SSH
+
+    # Stage 3: desktop readiness (desktop profiles only)
+    if is_desktop:
+        elapsed = int(time.monotonic() - start)
+        remaining = max_wait - elapsed
+        if remaining <= 0:
+            console.print(f"[red]Timeout before desktop check.[/red]")
+            return False
+
+        template_name = recipe.get("template_name", "") if recipe else ""
+        console.print(f"  [dim]Waiting for desktop environment ({template_name})...[/dim]")
+
+        check_cmd = "systemctl is-active graphical.target"
+        if template_name == "desktop-minimal":
+            check_cmd = "ps aux | grep -E 'openbox' | grep -v grep >/dev/null"
+        elif template_name == "desktop":
+            check_cmd = "systemctl is-active graphical.target && systemctl is-active lightdm"
+
+        desk_start = time.monotonic()
+        while time.monotonic() - desk_start < remaining:
+            cp = subprocess.run(
+                ssh_cmd + [f"{user}@{target}", f"bash -lc {shlex.quote(check_cmd)}"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if cp.returncode == 0:
+                console.print(f"  [green]Desktop ready[/green]")
+                break
+            time.sleep(3.0)
+        else:
+            console.print(f"  [yellow]Desktop did not become ready within timeout.[/yellow]")
+            # Not a hard failure — the VM is still usable via SSH
+
+    console.print(f"[green]{name} is ready[/green]")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Inventory / listing
 # ---------------------------------------------------------------------------
+
+def _is_latita_instance(name: str, cfg: Config) -> bool:
+    """Return True if name is a latita-managed instance (has metadata files)."""
+    inst_dir = cfg.inst_dir / name
+    if not inst_dir.is_dir():
+        return False
+    return any((inst_dir / f).exists() for f in ("recipe.json", "spec.json", "env"))
+
+
+def _looks_like_latita_created(name: str, cfg: Config) -> bool:
+    """Return True if the VM's disk path suggests it was created by latita.
+
+    Detects orphaned VMs (disk files from /tmp/latita-run-* or latita vault) that
+    lost their metadata.
+    """
+    cp = run(
+        ["virsh", "-c", cfg.libvirt_uri, "dumpxml", name],
+        capture=True, check=False,
+    )
+    if cp.returncode != 0:
+        return False
+    xml = cp.stdout
+    import re
+    for match in re.finditer(r'<source file="([^"]*)"', xml):
+        disk_path = match.group(1)
+        if "/latita-run-" in disk_path:
+            return True
+        vault = str(cfg.root_dir)
+        if disk_path.startswith(vault):
+            return True
+    return False
+
 
 def scan_instances() -> list[dict[str, Any]]:
     cfg = get_config()
     cfg.ensure_dirs()
     inst_names = {d.name for d in cfg.inst_dir.iterdir() if d.is_dir()} if cfg.inst_dir.exists() else set()
-    # Only show VMs that have a latita instance directory — hide external VMs
     names = set(inst_names)
+    virsh_names = set()
     try:
         cp = run(["virsh", "-c", cfg.libvirt_uri, "list", "--all", "--name"], capture=True, check=False)
         if cp.returncode == 0:
             virsh_names = {line.strip() for line in cp.stdout.splitlines() if line.strip()}
-            names |= (virsh_names & inst_names)
+            names |= virsh_names
     except Exception:
         pass
 
     entries: list[dict[str, Any]] = []
     for name in sorted(names):
+        is_latita = _is_latita_instance(name, cfg)
+        is_orphaned = not is_latita and _looks_like_latita_created(name, cfg)
         recipe = read_instance_recipe(name)
         spec = read_instance_spec(name)
         env = read_instance_env(name)
         overlay = cfg.inst_dir / name / f"{name}.qcow2"
+        downloading_marker = cfg.inst_dir / name / ".downloading"
+        creating_marker = cfg.inst_dir / name / ".creating"
+
+        if downloading_marker.exists():
+            entries.append({
+                "name": name,
+                "source": "latita",
+                "profile": recipe.get("profile", "unknown") if recipe else "unknown",
+                "template": recipe.get("template_name", "") if recipe else "",
+                "status": "downloading",
+                "mgmt_ip": "",
+                "ip": "",
+                "interfaces": {},
+                "cpus": recipe.get("cpus") if recipe else None,
+                "memory": recipe.get("memory") if recipe else None,
+                "transient": False,
+                "destroy_on_stop": False,
+                "expire_at": None,
+                "max_runs": None,
+                "run_count": 0,
+                "overlay_exists": False,
+                "applied_capsules": [],
+            })
+            continue
+
+        if creating_marker.exists():
+            entries.append({
+                "name": name,
+                "source": "latita",
+                "profile": recipe.get("profile", "unknown") if recipe else "unknown",
+                "template": recipe.get("template_name", "") if recipe else "",
+                "status": "creating",
+                "mgmt_ip": "",
+                "ip": "",
+                "interfaces": {},
+                "cpus": recipe.get("cpus") if recipe else None,
+                "memory": recipe.get("memory") if recipe else None,
+                "transient": False,
+                "destroy_on_stop": False,
+                "expire_at": None,
+                "max_runs": None,
+                "run_count": 0,
+                "overlay_exists": False,
+                "applied_capsules": [],
+            })
+            continue
 
         state = ""
         defined = False
@@ -1611,7 +2024,7 @@ def scan_instances() -> list[dict[str, Any]]:
             pass
 
         interfaces = {}
-        if state == "running":
+        if is_latita and state == "running":
             try:
                 interfaces = get_vm_interfaces(name)
             except Exception:
@@ -1624,12 +2037,16 @@ def scan_instances() -> list[dict[str, Any]]:
         max_runs = spec.get("max_runs")
         run_count = spec.get("run_count", 0)
 
-        status = state or ("stored" if overlay.exists() else "broken")
-        wan_ip = get_vm_wan_ip(name) if state == "running" else ""
+        if is_latita:
+            status = state or ("stored" if overlay.exists() else "broken")
+        else:
+            status = state if state else "unknown"
+        wan_ip = get_vm_wan_ip(name) if is_latita and state == "running" else ""
         cpus = recipe.get("cpus") if recipe else None
         memory = recipe.get("memory") if recipe else None
         entries.append({
             "name": name,
+            "source": "orphaned" if is_orphaned else ("latita" if is_latita else "external"),
             "profile": recipe.get("profile", env.get("PROFILE", "unknown")) if recipe else env.get("PROFILE", "unknown"),
             "template": recipe.get("template_name", env.get("TEMPLATE", "")) if recipe else env.get("TEMPLATE", ""),
             "status": status,
@@ -1640,12 +2057,12 @@ def scan_instances() -> list[dict[str, Any]]:
             "memory": memory,
         "transient": transient,
         "destroy_on_stop": destroy_on_stop,
-        "expire_at": expire_at,
-        "max_runs": max_runs,
-        "run_count": run_count,
-        "overlay_exists": overlay.exists(),
-        "applied_capsules": spec.get("applied_capsules", []) if spec else [],
-    })
+            "expire_at": expire_at,
+            "max_runs": max_runs,
+            "run_count": run_count,
+            "overlay_exists": overlay.exists(),
+            "applied_capsules": spec.get("applied_capsules", []) if spec else [],
+        })
     return entries
 
 
@@ -1656,6 +2073,7 @@ def list_instances() -> None:
         return
     table = Table(title="Instances")
     table.add_column("Name")
+    table.add_column("Source")
     table.add_column("Template")
     table.add_column("Type")
     table.add_column("Status")
@@ -1676,6 +2094,7 @@ def list_instances() -> None:
             constraints.append("caps: " + ",".join(e["applied_capsules"]))
         table.add_row(
             e["name"],
+            e["source"],
             e["template"] or e["profile"],
             ", ".join(ctype) if ctype else "persistent",
             e["status"],
@@ -1706,6 +2125,23 @@ def doctor() -> None:
         console.print(f'  libvirt URI: [green]{cfg.libvirt_uri}[/green] (session mode)')
     else:
         console.print(f'  libvirt URI: [yellow]{cfg.libvirt_uri}[/yellow] (system mode — may need sudo)')
+
+    # Mode implications
+    console.print('\n[bold]Mode implications[/bold]')
+    if cfg.is_session:
+        console.print('  [bold]Session mode[/bold] — unprivileged, works out of the box')
+        console.print('    - VMs use isolated SLIRP networking (10.0.2.0/24 each)')
+        console.print('    - VMs [red]cannot[/red] reach each other (isolated per VM)')
+        console.print('    - SSH access via [green]localhost:PORT[/green] with port forwarding')
+        console.print('    - Use this for quick one-offs, CI, and unprivileged workstations')
+        console.print('    - Switch to system mode for multi-VM labs or VM-to-VM networking')
+    else:
+        console.print('  [bold]System mode[/bold] — requires root / libvirtd')
+        console.print('    - VMs share a NAT bridge (e.g. 192.168.122.0/24)')
+        console.print('    - VMs [green]can[/green] reach each other on the same network')
+        console.print('    - SSH access via direct VM IP (e.g. 192.168.122.x)')
+        console.print('    - Use this for production, multi-VM labs, and networking tests')
+        console.print('    - Requires libvirtd running and user in libvirt group (or sudo)')
 
     try:
         subprocess.run(['/usr/bin/python3', '-c', 'import gi'], check=True, capture_output=True)

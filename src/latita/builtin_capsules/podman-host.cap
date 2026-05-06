@@ -14,11 +14,20 @@ provision:
   root_commands:
     - loginctl enable-linger {guest_user}
   user_commands:
-    - runuser -u {guest_user} -- podman info >/dev/null || true
+    - podman info >/dev/null || true
 
 live:
   user: dev
   commands:
-    - podman info >/dev/null || true
+    - |
+      # Ensure podman is available (idempotent for live apply on bare VMs)
+      if ! command -v podman >/dev/null 2>&1; then
+        if command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y podman crun slirp4netns fuse-overlayfs container-selinux
+        elif command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y podman
+        fi
+      fi
+      podman info >/dev/null || true
 
 verify: podman --version && echo "[OK] podman installed" || echo "[FAIL] podman missing"

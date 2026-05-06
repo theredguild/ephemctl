@@ -21,7 +21,16 @@ provision:
 live:
   user: dev
   commands:
-    - mkdir -p /home/{guest_user}/workspace
-    - podman run -d --replace --name code-server --restart=unless-stopped -p 0.0.0.0:8443:8080 -v /home/{guest_user}/workspace:/home/coder/project:Z ghcr.io/coder/code-server:latest
+    - |
+      # Ensure podman is available (idempotent for live apply on bare VMs)
+      if ! command -v podman >/dev/null 2>&1; then
+        if command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y podman crun slirp4netns fuse-overlayfs container-selinux
+        elif command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y podman
+        fi
+      fi
+      mkdir -p /home/{guest_user}/workspace
+      podman run -d --replace --name code-server --restart=unless-stopped -p 0.0.0.0:8443:8080 -v /home/{guest_user}/workspace:/home/coder/project:Z ghcr.io/coder/code-server:latest
 
 verify: podman ps | grep -q code-server && echo "[OK] code-server running" || echo "[FAIL] code-server not running"

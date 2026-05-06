@@ -29,6 +29,10 @@ def env_path(name: str, cfg: Config | None = None) -> Path:
     return instance_dir(name, cfg) / "instance.env"
 
 
+def error_log_path(name: str, cfg: Config | None = None) -> Path:
+    return instance_dir(name, cfg) / "last-errors.log"
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")

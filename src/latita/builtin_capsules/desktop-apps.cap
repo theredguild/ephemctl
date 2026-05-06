@@ -1,0 +1,50 @@
+description: Desktop extras — Brave browser and taskbar
+compatibility:
+  profiles: [desktop]
+  os_family: [fedora]
+depends_on: []
+
+provision:
+  packages:
+    - lxpanel
+    - brave-browser
+  write_files:
+    - path: /etc/yum.repos.d/brave-browser.repo
+      owner: root:root
+      permissions: "0644"
+      content: |
+        [brave-browser]
+        name=Brave Browser
+        enabled=1
+        baseurl=https://brave-browser-rpm-release.s3.brave.com/$basearch
+        gpgcheck=1
+        gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+  root_commands:
+    - rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc || true
+  user_commands:
+    - echo "lxpanel &" >> ~/.xinitrc.tmp || true
+
+live:
+  user: dev
+  commands:
+    - |
+      if ! command -v dnf >/dev/null 2>&1; then
+        echo "dnf not found — skipping desktop-apps"
+        exit 0
+      fi
+      if rpm -q brave-browser >/dev/null 2>&1 && rpm -q lxpanel >/dev/null 2>&1; then
+        echo "desktop-apps already installed"
+        exit 0
+      fi
+      sudo tee /etc/yum.repos.d/brave-browser.repo >/dev/null << 'REPOEOF'
+      [brave-browser]
+      name=Brave Browser
+      enabled=1
+      baseurl=https://brave-browser-rpm-release.s3.brave.com/$basearch
+      gpgcheck=1
+      gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+      REPOEOF
+      sudo rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+      sudo dnf install -y brave-browser lxpanel
+
+verify: rpm -q brave-browser lxpanel 2>/dev/null && echo "[OK] desktop-apps installed" || echo "[FAIL] some packages missing"

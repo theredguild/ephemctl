@@ -68,11 +68,13 @@ def resolve_capsules(
     *,
     profile: str = "",
     os_family: str = "",
-) -> list[dict[str, Any]]:
+) -> list[tuple[str, dict[str, Any]]]:
     """Resolve capsule names recursively, including dependencies.
 
     Uses depth-first traversal of `depends_on` lists. Dependencies are
     prepended before the requesting capsule so provisioning order is correct.
+
+    Returns a list of (name, data) tuples preserving dependency order.
     """
     resolved_map: dict[str, dict[str, Any]] = {}
 
@@ -100,7 +102,7 @@ def resolve_capsules(
     for name in capsule_names:
         _resolve(name, [])
 
-    return list(resolved_map.values())
+    return [(name, resolved_map[name]) for name in resolved_map]
 
 
 def capsule_provision_fragment(capsule: dict[str, Any]) -> dict[str, Any]:

@@ -112,9 +112,9 @@ class TestLiveCommands:
 
 class TestResolve:
     def test_resolve_builtin(self):
-        # ai-agents depends on hermes
+        # ai-agents has no dependencies after removal of hermes dep
         resolved = resolve_capsules(["ai-agents"], profile="headless", os_family="fedora")
-        assert len(resolved) == 2  # hermes + ai-agents
+        assert len(resolved) == 1  # just ai-agents
 
     def test_resolve_incompatible(self):
         with pytest.raises(Exception):
@@ -133,21 +133,21 @@ class TestListCompatible:
 
 class TestDependsOn:
     def test_single_dependency_resolved(self):
-        # ai-agents depends on hermes
-        resolved = resolve_capsules(["ai-agents"], profile="headless", os_family="fedora")
-        names = [c.get("description", "") for c in resolved]
-        # hermes should come before ai-agents
-        assert any("hermes" in n.lower() for n in names)
-        assert any("ai" in n.lower() for n in names)
+        # code-server depends on podman-host
+        resolved = resolve_capsules(["code-server"], profile="headless", os_family="fedora")
+        names = [data.get("description", "") for _, data in resolved]
+        # podman-host should come before code-server
+        assert any("podman" in n.lower() for n in names)
+        assert any("code-server" in n.lower() for n in names)
 
     def test_dependency_deduplication(self):
-        # Requesting both hermes and ai-agents should not duplicate hermes
+        # Requesting both podman-host and code-server should not duplicate podman-host
         resolved = resolve_capsules(
-            ["hermes", "ai-agents"],
+            ["podman-host", "code-server"],
             profile="headless",
             os_family="fedora",
         )
-        # Total should be exactly 2 (hermes + ai-agents)
+        # Total should be exactly 2 (podman-host + code-server)
         assert len(resolved) == 2
 
     def test_cycle_detection(self):
@@ -168,14 +168,14 @@ class TestDependsOn:
     def test_dependency_order(self):
         # Dependencies should appear before dependents in the resolved list
         resolved = resolve_capsules(
-            ["ai-agents"],
+            ["code-server"],
             profile="headless",
             os_family="fedora",
         )
-        descs = [c.get("description", "") for c in resolved]
-        hermes_idx = next(i for i, d in enumerate(descs) if "hermes" in d.lower())
-        ai_idx = next(i for i, d in enumerate(descs) if "ai" in d.lower())
-        assert hermes_idx < ai_idx
+        descs = [data.get("description", "") for _, data in resolved]
+        podman_idx = next(i for i, d in enumerate(descs) if "podman" in d.lower())
+        cs_idx = next(i for i, d in enumerate(descs) if "code-server" in d.lower())
+        assert podman_idx < cs_idx
 
     def test_ai_agents_resolves_all_deps(self):
         resolved = resolve_capsules(
@@ -183,9 +183,10 @@ class TestDependsOn:
             profile="headless",
             os_family="fedora",
         )
-        descs = [c.get("description", "").lower() for c in resolved]
-        assert any("hermes" in d for d in descs)
-        assert any("all major ai" in d for d in descs)
+        descs = [data.get("description", "").lower() for _, data in resolved]
+        # ai-agents no longer depends on hermes; it should resolve to just itself
+        assert len(descs) == 1
+        assert any("ai" in d for d in descs)
 
 
 class TestBuiltinCapsules:
@@ -193,7 +194,7 @@ class TestBuiltinCapsules:
 
     def test_all_builtin_capsules_load(self):
         names = list_capsules()
-        assert len(names) == 6  # ai-agents, code-server, hermes, podman-host, tailscale, whisper
+        assert len(names) == 7  # ai-agents, code-server, desktop-apps, hermes, podman-host, tailscale, whisper
         for name in names:
             cap = load_capsule(name)
             assert "description" in cap, f"{name} missing description"
@@ -203,12 +204,17 @@ class TestBuiltinCapsules:
 
     def test_all_capsules_resolve_individually(self):
         for name in list_capsules():
-            resolved = resolve_capsules([name], profile="headless", os_family="fedora")
+            cap = load_capsule(name)
+            profiles = cap.get("compatibility", {}).get("profiles", ["headless"])
+            profile = profiles[0] if profiles else "headless"
+            os_family_list = cap.get("compatibility", {}).get("os_family", ["fedora"])
+            os_family = os_family_list[0] if os_family_list else "fedora"
+            resolved = resolve_capsules([name], profile=profile, os_family=os_family)
             assert len(resolved) >= 1
             # Verify dependency order: dependencies come before dependents
             if len(resolved) > 1:
-                descs = [c.get("description", "") for c in resolved]
-                for i, cap in enumerate(resolved):
+                descs = [data.get("description", "") for _, data in resolved]
+                for i, (cap_name, cap) in enumerate(resolved):
                     deps = cap.get("depends_on", [])
                     if isinstance(deps, str):
                         deps = [deps]
@@ -225,5 +231,8 @@ class TestBuiltinCapsules:
     def test_all_capsules_are_compatible_with_headless_fedora(self):
         for name in list_capsules():
             cap = load_capsule(name)
+            profiles = cap.get("compatibility", {}).get("profiles", [])
+            if "headless" not in profiles:
+                continue
             ok, reason = check_capsule_compatibility(cap, profile="headless", os_family="fedora")
             assert ok, f"{name} incompatible with headless/fedora: {reason}"

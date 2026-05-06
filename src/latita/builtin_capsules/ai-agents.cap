@@ -1,8 +1,8 @@
-description: All major AI coding agents (Claude Code, Codex, Gemini, Kimi, OpenCode, Hermes, Aider, Pi)
+description: Major AI coding agents (Claude Code, Codex, Gemini, OpenCode, Pi, Kimi)
 compatibility:
   profiles: [headless, desktop]
   os_family: [fedora, ubuntu]
-depends_on: [hermes]
+depends_on: []
 
 provision:
   packages:
@@ -12,15 +12,17 @@ provision:
     - git
   user_commands:
     - |
+      # Configure npm to install globally into user-local prefix (avoids root permissions)
+      npm config set prefix /home/{guest_user}/.local
+      export PATH="/home/{guest_user}/.local/bin:$PATH"
       # Node.js based agents
-      npm install -g @anthropic-ai/claude-code 2>/dev/null || true
-      npm install -g @openai/codex 2>/dev/null || true
-      npm install -g @google/gemini-cli 2>/dev/null || true
-      npm install -g opencode-ai 2>/dev/null || true
-      npm install -g @mariozechner/pi-coding-agent 2>/dev/null || true
+      npm install -g @anthropic-ai/claude-code || true
+      npm install -g @openai/codex || true
+      npm install -g @google/gemini-cli || true
+      npm install -g opencode-ai || true
+      npm install -g @mariozechner/pi-coding-agent || true
       # Python based agents
       pip3 install --user kimi-cli 2>/dev/null || true
-      pip3 install --user aider-chat 2>/dev/null || true
       echo "AI agents installed. Verify with:"
       echo "  claude --version"
       echo "  codex --version"
@@ -28,19 +30,29 @@ provision:
       echo "  opencode --version"
       echo "  pi --version"
       echo "  kimi --help"
-      echo "  aider --version"
-      echo "  hermes --help"
 
 live:
   user: dev
   commands:
-    - npm install -g @anthropic-ai/claude-code 2>/dev/null || true
-    - npm install -g @openai/codex 2>/dev/null || true
-    - npm install -g @google/gemini-cli 2>/dev/null || true
-    - npm install -g opencode-ai 2>/dev/null || true
-    - npm install -g @mariozechner/pi-coding-agent 2>/dev/null || true
-    - pip3 install --user kimi-cli 2>/dev/null || true
-    - pip3 install --user aider-chat 2>/dev/null || true
-    - pip3 install --user hermes-agent 2>/dev/null || true
+    - |
+      # Ensure dependencies are installed (idempotent for live apply)
+      if ! command -v npm >/dev/null 2>&1 || ! command -v pip3 >/dev/null 2>&1; then
+        if command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y nodejs npm python3-pip git
+        elif command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y nodejs npm python3-pip git
+        fi
+      fi
+      # Configure npm prefix for user-local global installs
+      npm config set prefix /home/{guest_user}/.local
+      export PATH="/home/{guest_user}/.local/bin:$PATH"
+      # Node.js based agents
+      npm install -g @anthropic-ai/claude-code || true
+      npm install -g @openai/codex || true
+      npm install -g @google/gemini-cli || true
+      npm install -g opencode-ai || true
+      npm install -g @mariozechner/pi-coding-agent || true
+      # Python based agents
+      pip3 install --user kimi-cli 2>/dev/null || true
 
-verify: (claude --version 2>/dev/null || true) && (codex --version 2>/dev/null || true) && echo "[OK] AI agents present" || echo "[FAIL] Some agents missing"
+verify: export PATH="/home/{guest_user}/.local/bin:$PATH" && claude --version && codex --version && gemini --version && opencode --version && pi --version && echo "[OK] AI agents present" || echo "[FAIL] Some agents missing"

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -21,8 +23,8 @@ from textual.widgets import (
     DataTable,
     Input,
     Label,
-    ListView,
     ListItem,
+    ListView,
     Select,
     Static,
 )
@@ -49,6 +51,8 @@ from .operations import (
     create_instance,
     destroy_instance,
     doctor,
+    fetch_vm_error_log,
+    get_vm_init_state,
     pause_instance,
     resume_instance,
     run_instance,
@@ -78,13 +82,19 @@ def _ensure_running(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Action list item
+# Action list items
 # ---------------------------------------------------------------------------
 
 class ActionItem(ListItem):
-    def __init__(self, action_id: str | None, label: str, **kwargs: Any) -> None:
+    def __init__(self, action_id: str, label: str, **kwargs: Any) -> None:
         super().__init__(Label(label), **kwargs)
         self.action_id = action_id
+
+
+class GroupHeader(ListItem):
+    def __init__(self, label: str, **kwargs: Any) -> None:
+        super().__init__(Label(label), **kwargs)
+        self.action_id = None
 
 
 # ---------------------------------------------------------------------------
@@ -308,11 +318,18 @@ class FormScreen(Screen[dict[str, Any] | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id=self._box_id, classes="form-box"):
             yield Static(self._title, id="form-title", classes="form-title")
-            yield from self._compose_fields()
-            yield Static("", id="form-error", classes="form-error")
-            with Horizontal(id="form-buttons", classes="form-buttons"):
-                yield Button("Create", id="btn-create", variant="primary")
-                yield Button("Cancel", id="btn-cancel")
+            with Horizontal(id="form-body"):
+                with Vertical(id="form-left"):
+                    yield from self._compose_fields()
+                    yield Static("", id="form-error", classes="form-error")
+                    with Horizontal(id="form-buttons", classes="form-buttons"):
+                        yield Button("Create", id="btn-create", variant="primary")
+                        yield Button("Cancel", id="btn-cancel")
+                        yield Button("Advanced ▶", id="btn-advanced")
+                with Vertical(id="form-right"):
+                    yield Input(value="dev", id="guest_user")
+                    yield Input(value="latita", password=True, id="password")
+                    yield Checkbox("Passwordless sudo", value=True, id="passwordless_sudo")
 
     def _compose_fields(self) -> ComposeResult:
         """Child classes override to yield extra widgets."""
@@ -333,14 +350,6 @@ class FormScreen(Screen[dict[str, Any] | None]):
         yield Select(video_opts, value=video_default or None, id="video_model")
         yield Static("Video model (desktop VMs only)", id="video-hint", classes="form-hint")
 
-        # Advanced toggle
-        yield Button("Advanced ▼", id="btn-advanced", variant="primary")
-        with Vertical(id="advanced-fields"):
-            yield Static("Guest user & authentication", classes="form-subtitle")
-            yield Input(value="dev", id="guest_user")
-            yield Input(value="latita", password=True, id="password")
-            yield Checkbox("Passwordless sudo", value=True, id="passwordless_sudo")
-
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-advanced":
             self._toggle_advanced()
@@ -350,14 +359,15 @@ class FormScreen(Screen[dict[str, Any] | None]):
             self.action_dismiss()
 
     def _toggle_advanced(self) -> None:
-        adv = self.query_one("#advanced-fields", Vertical)
+        right = self.query_one("#form-right", Vertical)
         btn = self.query_one("#btn-advanced", Button)
-        if adv.styles.display == "none":
-            adv.styles.display = "block"
-            btn.label = "Advanced ▲"
+        if right.styles.display == "none":
+            right.styles.width = "auto"
+            right.styles.display = "block"
+            btn.label = "Advanced ◀"
         else:
-            adv.styles.display = "none"
-            btn.label = "Advanced ▼"
+            right.styles.display = "none"
+            btn.label = "Advanced ▶"
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "profile":
@@ -396,9 +406,10 @@ class FormScreen(Screen[dict[str, Any] | None]):
         profile_widget = self.query_one("#profile", Select)
         current_template = str(profile_widget.value) if profile_widget.value else "headless"
         self._toggle_video_visibility(current_template)
-        # Hide advanced section by default
-        adv = self.query_one("#advanced-fields", Vertical)
-        adv.styles.display = "none"
+        # Hide advanced panel by default
+        right = self.query_one("#form-right", Vertical)
+        right.styles.width = "0"
+        right.styles.display = "none"
 
     def action_submit(self) -> None:
         name_widget = self.query_one("#name", Input)
@@ -420,6 +431,7 @@ class FormScreen(Screen[dict[str, Any] | None]):
     def _build_result(self, name: str, template_name: str, net_mode: str) -> dict[str, Any]:
         """Child classes override to add extra fields."""
         profile = self._template_profile(template_name)
+        template_data = self._templates.get(template_name, {})
         recipe: dict[str, Any] = {
             "profile": profile,
             "template_name": template_name,
@@ -429,6 +441,8 @@ class FormScreen(Screen[dict[str, Any] | None]):
                 "nat_network": "default" if net_mode == "nat" else "",
             },
         }
+        if "base_image" in template_data:
+            recipe["base_image"] = template_data["base_image"]
         if profile == "desktop":
             video_widget = self.query_one("#video_model", Select)
             video = str(video_widget.value) if video_widget.value else ""
@@ -479,23 +493,95 @@ class CreateVMScreen(FormScreen):
         return {"mode": "create", "recipe": recipe}
 
 
-class RunVMScreen(FormScreen):
-    """Native TUI form for running a one-shot ephemeral VM."""
+class RunVMScreen(Screen[dict[str, Any] | None]):
+    """Minimal one-shot VM — pick a template, hit Run."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel", show=False),
+        Binding("e", "edit_template", "Edit", show=True),
+    ]
 
     def __init__(self) -> None:
-        super().__init__("Run one-shot VM", "run-box")
+        super().__init__()
+        self._templates = list_latita_templates()
 
-    def _compose_fields(self) -> ComposeResult:
-        yield from super()._compose_fields()
-        yield Input(placeholder="Command to run inside VM (optional, e.g. uname -a)", id="command")
-        yield Static("This VM is transient and will be destroyed on shutdown.", id="run-warn", classes="form-warn")
+    def compose(self) -> ComposeResult:
+        template_names = sorted(self._templates.keys())
+        if not template_names:
+            template_names = ["headless"]
+        template_options = [(n, n) for n in template_names]
+        default_template = template_options[0][1] if template_options else "headless"
 
-    def _build_result(self, name: str, profile: str, net_mode: str) -> dict[str, Any]:
-        recipe = super()._build_result(name, profile, net_mode)
-        command = self.query_one("#command", Input).value.strip()
-        if command:
-            recipe["command"] = command
-        return {"mode": "run", "recipe": recipe}
+        with Vertical(id="run-box", classes="form-box"):
+            yield Static("Run one-shot VM", id="form-title", classes="form-title")
+            yield Select(template_options, value=default_template, id="run-profile")
+            yield Static("", id="run-defaults", classes="form-hint")
+            yield Static("Transient, destroyed on shutdown", id="run-warn", classes="form-warn")
+            with Horizontal(id="form-buttons", classes="form-buttons"):
+                yield Button("Run", id="btn-run", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#run-profile", Select).focus()
+        self._update_defaults()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "run-profile":
+            self._update_defaults()
+
+    def _update_defaults(self) -> None:
+        sel = self.query_one("#run-profile", Select)
+        template_name = str(sel.value) if sel.value else "headless"
+        data = self._templates.get(template_name, {})
+        defaults_widget = self.query_one("#run-defaults", Static)
+        profile = data.get("profile", "headless")
+        cpus = data.get("cpus", "?")
+        mem = data.get("memory", "?")
+        net = data.get("network", {}).get("mode", "user" if get_config().is_session else "nat")
+        base = data.get("base_image", "?")
+        defaults_widget.update(
+            f"profile={profile}  cpus={cpus}  mem={mem}  net={net}  base={base}  [E] Edit"
+        )
+
+    def _template_profile(self, template_name: str) -> str:
+        data = self._templates.get(template_name, {})
+        return str(data.get("profile", "headless")).lower()
+
+    def action_edit_template(self) -> None:
+        sel = self.query_one("#run-profile", Select)
+        template_name = str(sel.value) if sel.value else "headless"
+        path = get_template_path(template_name)
+        if path and path.exists():
+            _open_editor(path)
+        else:
+            self.notify(f"Template file not found for '{template_name}'", severity="warning")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-run":
+            self.action_submit()
+        elif event.button.id == "btn-cancel":
+            self.action_dismiss()
+
+    def action_submit(self) -> None:
+        profile_widget = self.query_one("#run-profile", Select)
+        template_name = str(profile_widget.value) if profile_widget.value else "headless"
+        profile = self._template_profile(template_name)
+        template_data = self._templates.get(template_name, {})
+        name = f"{template_name}-run"
+        net_mode = "user" if get_config().is_session else "nat"
+        recipe: dict[str, Any] = {
+            "profile": profile,
+            "template_name": template_name,
+            "name": name,
+            "network": {"mode": net_mode, "nat_network": "default" if net_mode == "nat" else ""},
+            "ephemeral": {"transient": True, "destroy_on_stop": True},
+        }
+        if "base_image" in template_data:
+            recipe["base_image"] = template_data["base_image"]
+        self.dismiss({"mode": "run", "recipe": recipe})
+
+    def action_dismiss(self) -> None:
+        self.dismiss(None)
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +720,67 @@ class InfoScreen(Screen):
         return detail
 
 
+class LogsScreen(Screen):
+    """Show diagnostic logs for a VM."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back", show=False),
+        Binding("q", "app.pop_screen", "Back", show=False),
+    ]
+
+    def __init__(self, name: str, log_text: str) -> None:
+        super().__init__()
+        self._name = name
+        self._log_text = log_text
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="logs-box"):
+            yield Static(f"Logs: {self._name}", id="logs-title")
+            with ScrollableContainer(id="logs-scroll"):
+                yield Static(self._log_text, id="logs-content", markup=False)
+            yield Static("[Esc/q] Back", id="logs-hint")
+
+
+class BaseImagePickerScreen(Screen[str | None]):
+    """Pick a base image to download from the catalog."""
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Cancel", show=False),
+    ]
+
+    def __init__(self, missing_image: str, on_result: Callable[[str | None], None]) -> None:
+        super().__init__()
+        self._missing = missing_image
+        self._on_result = on_result
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="image-box"):
+            yield Static(f"Base image '{self._missing}' not found", id="image-title")
+            yield Static("Select an image to download:", id="image-hint2", classes="form-hint")
+            options = []
+            for label, data in BASE_IMAGES.items():
+                cached = (get_config().base_dir / data["filename"]).exists()
+                tag = " (cached)" if cached else ""
+                options.append((f"{label}{tag}", data["filename"]))
+            if options:
+                yield Select(options, value=options[0][1], id="image-select")
+            else:
+                yield Static("No images in catalog", classes="form-error")
+            with Horizontal(classes="form-buttons"):
+                yield Button("Download", id="btn-download", variant="primary")
+                yield Button("Cancel", id="btn-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-download":
+            sel = self.query_one("#image-select", Select)
+            filename = str(sel.value) if sel.value else None
+            self._on_result(filename)
+            self.dismiss(filename)
+        elif event.button.id == "btn-cancel":
+            self._on_result(None)
+            self.dismiss(None)
+
+
 # ---------------------------------------------------------------------------
 # Browser screen base (Templates / Capsules)
 # ---------------------------------------------------------------------------
@@ -646,7 +793,6 @@ class BrowserScreen(Screen):
         Binding("q", "app.pop_screen", "Back", show=False),
         Binding("tab", "toggle_pane", "Toggle pane", show=True),
         Binding("e", "edit", "Edit", show=True),
-        Binding("enter", "edit", "Edit", show=False),
         Binding("d", "delete", "Delete", show=True),
         Binding("r", "rename", "Rename", show=True),
         Binding("y", "duplicate", "Duplicate", show=True),
@@ -700,12 +846,12 @@ class BrowserScreen(Screen):
                     yield Static("Select an item.\n", id="browser-detail")
                 yield Static(
                     "Shortcuts\n"
-                    "  Tab    Toggle list / detail\n"
-                    "  Enter  Edit in $EDITOR\n"
+                    "  e      Edit in $EDITOR\n"
                     "  d      Delete\n"
                     "  r      Rename\n"
                     "  y      Duplicate\n"
                     "  n      New\n"
+                    "  Tab    Toggle list / detail\n"
                     "  Esc    Back",
                     id="browser-actions",
                 )
@@ -1047,6 +1193,8 @@ class Dashboard(App):
         super().__init__()
         self._vm_list: list[dict[str, Any]] = []
         self._action_items: dict[str, ActionItem] = {}
+        self._group_headers: dict[str, GroupHeader] = {}
+        self._vm_init_cache: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
@@ -1064,37 +1212,46 @@ class Dashboard(App):
 
     def on_mount(self) -> None:
         table = self.query_one("#vm-table", DataTable)
-        table.add_columns("Name", "Status", "IP", "Profile", "CPUs", "Mem")
+        table.add_columns("Name", "Source", "Status", "Init", "IP", "Template", "CPUs", "Mem")
         self._build_action_list()
         self._refresh_vm_list()
         table.focus()
+        self.set_interval(5.0, self._poll_init_states)
 
     def _build_action_list(self) -> None:
         action_list = self.query_one("#action-list", ListView)
         specs = [
-            ("start", "Start VM", False),
-            ("stop", "Stop VM", False),
-            ("pause", "Pause VM", False),
-            ("resume", "Resume VM", False),
-            ("destroy", "Destroy VM", False),
-            ("ssh", "SSH", False),
-            ("connect", "Connect", False),
-            ("apply_capsule", "Apply Capsule", False),
-            ("info", "Info", False),
-            (None, "", False),   # spacer
-            ("create", "Create VM", True),
-            ("run", "Run one-shot", True),
-            ("templates", "Templates", True),
-            ("capsules", "Capsules", True),
-            (None, "", False),   # spacer
-            ("bootstrap", "Bootstrap", True),
-            ("doctor", "Doctor", True),
-            (None, "", False),   # spacer
-            ("quit", "Quit", True),
+            ("__group__", "Lifecycle"),
+            ("start", "  ▶ Start"),
+            ("pause", "  ⏸ Pause"),
+            ("resume", "  ▶ Resume"),
+            ("stop", "  ⏹ Stop"),
+            ("destroy", "  🗑 Destroy"),
+            ("__group__", "VM"),
+            ("ssh", "  SSH"),
+            ("connect", "  Connect"),
+            ("apply_capsule", "  Apply Capsule"),
+            ("info", "  ℹ Info"),
+            ("logs", "  📋 Logs"),
+            ("__group__", "General"),
+            ("create", "  Create VM"),
+            ("run", "  Run one-shot"),
+            ("templates", "  Templates"),
+            ("capsules", "  Capsules"),
+            ("bootstrap", "  Bootstrap"),
+            ("doctor", "  Doctor"),
+            ("__group__", ""),
+            ("quit", "  Quit"),
         ]
-        for aid, label, _ in specs:
-            item = ActionItem(aid, label)
-            self._action_items[aid or f"__spacer_{id(item)}"] = item
+        for aid, label in specs:
+            if aid == "__group__":
+                item = GroupHeader(label)
+                self._group_headers[label] = item
+                item.disabled = True
+                item.add_class("group-header")
+            else:
+                item = ActionItem(aid, label)
+                self._action_items[aid] = item
             action_list.append(item)
         if action_list.children:
             action_list.index = 0
@@ -1106,38 +1263,53 @@ class Dashboard(App):
     def _update_action_states(self) -> None:
         vm = self.selected_vm
         status = vm.get("status", "") if vm else ""
-        states = {
+        is_external = vm.get("source") == "external" if vm else False
+
+        visible = {
+            "start": bool(vm and status not in ("running", "paused", "downloading", "creating")),
+            "pause": bool(vm and status == "running"),
+            "resume": bool(vm and status == "paused"),
+            "stop": bool(vm and status in ("running", "paused")),
+            "destroy": bool(vm and not is_external and status not in ("downloading", "creating")),
+            "ssh": bool(vm and status == "running" and not is_external),
+            "connect": bool(vm and status == "running" and not is_external),
+            "apply_capsule": bool(vm and status == "running" and not is_external),
+            "info": bool(vm),
+            "logs": bool(vm and status == "running" and not is_external),
             "create": True,
             "run": True,
             "bootstrap": True,
             "doctor": True,
             "templates": True,
             "capsules": True,
-            "start": bool(vm and status not in ("running", "paused")),
-            "stop": bool(vm and status == "running"),
-            "pause": bool(vm and status == "running"),
-            "resume": bool(vm and status == "paused"),
-            "destroy": bool(vm),
-            "ssh": bool(vm and status == "running"),
-            "connect": bool(vm and status == "running"),
-            "apply_capsule": bool(vm and status == "running"),
-            "info": bool(vm),
             "quit": True,
         }
-        action_list = self.query_one("#action-list", ListView)
+
+        lifecycle_visible = any(visible.get(k) for k in ("start", "pause", "resume", "stop", "destroy"))
+        vm_visible = any(visible.get(k) for k in ("ssh", "connect", "apply_capsule", "info", "logs"))
+
         for key, item in self._action_items.items():
-            if key.startswith("__spacer_"):
-                item.disabled = True
-                continue
-            item.disabled = not states.get(key, True)
-            item.refresh()
+            item.display = visible.get(key, True)
+            item.disabled = not visible.get(key, True)
+
+        if "Lifecycle" in self._group_headers:
+            self._group_headers["Lifecycle"].display = lifecycle_visible
+        if "VM" in self._group_headers:
+            self._group_headers["VM"].display = vm_visible
 
     def _update_statusbar(self) -> None:
         vm = self.selected_vm
         name = vm["name"] if vm else "—"
         total = len(self._vm_list)
+        cfg = get_config()
+        mode_label = "Session" if cfg.is_session else "System"
+        mode_hint = "isolated" if cfg.is_session else "shared"
         status = self.query_one("#statusbar", Static)
-        status.update(f" sel: {name} | {total} VMs")
+        status.update(f" sel: {name} | {total} VMs | Mode: {mode_label} ({mode_hint})")
+
+    def _update_statusbar_msg(self, msg: str) -> None:
+        status = self.query_one("#statusbar", Static)
+        status.update(f" {msg}")
 
     # --- Unified runner ------------------------------------------------------
 
@@ -1195,21 +1367,20 @@ class Dashboard(App):
             vm_table.focus()
 
     def _ensure_valid_cursor(self, action_list: ListView) -> None:
-        """If the highlighted action is disabled, jump to the nearest enabled one."""
         children = list(action_list.children)
         if not children:
             return
         idx = action_list.index if action_list.index is not None else 0
         if 0 <= idx < len(children):
             child = children[idx]
-            if isinstance(child, ActionItem) and not child.disabled:
+            if isinstance(child, (ActionItem, GroupHeader)) and child.display and not child.disabled:
                 return
         for direction in (1, -1):
             search_idx = idx
             for _ in range(len(children)):
                 search_idx = (search_idx + direction) % len(children)
                 child = children[search_idx]
-                if isinstance(child, ActionItem) and not child.disabled:
+                if isinstance(child, ActionItem) and child.display and not child.disabled:
                     action_list.index = search_idx
                     return
 
@@ -1224,13 +1395,13 @@ class Dashboard(App):
             self.selected_vm = None
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Enter on VM table triggers SSH."""
-        self.action_ssh()
+        """Enter on VM table triggers SSH. Guard against firing from other screens."""
+        if self.selected_vm:
+            self.action_ssh()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        """Enter on action list executes the action."""
         item = event.item
-        if isinstance(item, ActionItem) and item.action_id:
+        if isinstance(item, ActionItem) and item.action_id and item.display:
             self._run_action_id(item.action_id)
 
     # --- VM list refresh -----------------------------------------------------
@@ -1244,11 +1415,20 @@ class Dashboard(App):
         self._vm_list = new_list
         selected_row: Optional[int] = None
         for i, e in enumerate(new_list):
+            if e.get("source") == "external":
+                init_label = "external"
+            elif e.get("status") != "running":
+                init_label = "—"
+            else:
+                init_label = self._vm_init_cache.get(e["name"], "—")
+            source_label = f"[{e.get('source', 'latita')}]"
             table.add_row(
                 e.get("name", "?"),
+                source_label,
                 e.get("status", "?"),
+                init_label,
                 e.get("ip") or e.get("mgmt_ip") or "—",
-                e.get("profile") or "—",
+                e.get("template") or "—",
                 str(e.get("cpus") or "—"),
                 str(e.get("memory") or "—"),
             )
@@ -1267,6 +1447,52 @@ class Dashboard(App):
                 self.selected_vm = new_list[0]
         else:
             self.selected_vm = None
+
+    async def _poll_init_states(self) -> None:
+        """Background update of VM init states — never blocks the UI."""
+        running_latita = [
+            e for e in self._vm_list
+            if e.get("status") == "running" and e.get("source") == "latita"
+        ]
+        if not running_latita:
+            return
+
+        async def _check_one(name: str) -> tuple[str, dict[str, str]]:
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(get_vm_init_state, name),
+                    timeout=15.0,
+                )
+                return name, result
+            except Exception:
+                return name, {"cloud_init": "n/a", "desktop": "n/a", "overall": "—"}
+
+        results = await asyncio.gather(*[_check_one(e["name"]) for e in running_latita])
+        changed = False
+        for name, result in results:
+            state = result.get("overall", "—")
+            if state == "n/a":
+                state = "—"
+            prev = self._vm_init_cache.get(name)
+            if prev != state:
+                if prev == "initializing" and state == "ready":
+                    self.notify(f"VM '{name}' is ready", severity="information")
+                elif prev == "initializing" and state == "failed":
+                    self.notify(f"VM '{name}' failed to initialize", severity="error")
+                elif prev in ("—", None) and state == "initializing":
+                    pass
+                elif state == "ready" and prev in ("—", None):
+                    pass
+                self._vm_init_cache[name] = state
+                changed = True
+        # Prune stale entries
+        current_names = {e["name"] for e in self._vm_list}
+        stale = [n for n in self._vm_init_cache if n not in current_names]
+        for n in stale:
+            del self._vm_init_cache[n]
+            changed = True
+        if changed:
+            self._refresh_vm_list()
 
     # --- Action dispatcher ---------------------------------------------------
 
@@ -1343,30 +1569,81 @@ class Dashboard(App):
             return False
         return False  # Caller should prompt
 
-    def _download_and_create(self, result: dict[str, Any]) -> None:
-        """Download base image if needed, then create/run."""
+    def _download_and_create(self, result: dict[str, Any], base_image: str | None = None) -> None:
+        """Download base image if needed, then create/run in background."""
         recipe = result["recipe"]
         template_name = recipe.get("template_name", recipe.get("profile", "headless"))
-        base_image = recipe.get("base_image", get_config().default_base_name)
+        if base_image:
+            recipe["base_image"] = base_image
+        img = recipe.get("base_image", get_config().default_base_name)
         mode = result.get("mode", "create")
         command = recipe.get("command")
+        vm_name = recipe.get("name", "vm")
+        label = f"{'Create' if mode == 'create' else 'Run'} {vm_name}"
+        cfg = get_config()
+
+        needs_download = not (cfg.base_dir / img).exists()
+        if needs_download:
+            inst_dir = cfg.inst_dir / vm_name
+            inst_dir.mkdir(parents=True, exist_ok=True)
+            from .metadata import write_instance_recipe
+            write_instance_recipe(vm_name, recipe)
+            (inst_dir / ".downloading").write_text(img)
+            self._trigger_refresh()
+            self._update_statusbar_msg(f"Downloading {img} for {vm_name}...")
 
         def _do() -> None:
-            # Download if missing
-            ok = _maybe_download_base(base_image)
-            if not ok:
-                print(f"Base image '{base_image}' not available. Aborting.")
-                return
-            if mode == "create":
-                create_instance(template_name, name=recipe.get("name"), overrides=recipe)
-            else:
-                run_instance(
-                    template_name,
-                    command=command.split() if command else None,
-                    overrides=recipe,
-                )
+            try:
+                if needs_download:
+                    self.call_from_thread(lambda: self._update_statusbar_msg(f"Downloading {img} for {vm_name}..."))
+                ok = _maybe_download_base(img)
+                if not ok:
+                    marker = cfg.inst_dir / vm_name / ".downloading"
+                    if marker.exists():
+                        marker.unlink()
+                    self.call_from_thread(lambda: self._rollback_pending(vm_name))
+                    self.call_from_thread(lambda: self.notify(f"Base image '{img}' not available", severity="error"))
+                    return
+                if needs_download:
+                    marker = cfg.inst_dir / vm_name / ".downloading"
+                    if marker.exists():
+                        marker.unlink()
+                    (cfg.inst_dir / vm_name / ".creating").write_text(img)
+                    self.call_from_thread(lambda: self._update_statusbar_msg(f"Creating {vm_name}..."))
+                    self.call_from_thread(self._trigger_refresh)
+                if mode == "create":
+                    create_instance(template_name, name=recipe.get("name"), overrides=recipe, wait=False)
+                else:
+                    if needs_download:
+                        self.call_from_thread(lambda: self._rollback_pending(vm_name))
+                    run_instance(
+                        template_name,
+                        command=command.split() if command else None,
+                        overrides=recipe,
+                    )
+                creating_marker = cfg.inst_dir / vm_name / ".creating"
+                if creating_marker.exists():
+                    creating_marker.unlink()
+                self.call_from_thread(lambda: self.notify(f"{label} started", severity="information"))
+                self.call_from_thread(self._trigger_refresh)
+            except Exception as exc:
+                for m in (".downloading", ".creating"):
+                    p = cfg.inst_dir / vm_name / m
+                    if p.exists():
+                        p.unlink()
+                self.call_from_thread(lambda: self._rollback_pending(vm_name))
+                self.call_from_thread(lambda: self.notify(f"{label} failed: {exc}", severity="error"))
 
-        self._run_command(_do, f"{'Create' if mode == 'create' else 'Run'} VM")
+        self.notify(f"{label} in background...", severity="information")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _rollback_pending(self, name: str) -> None:
+        """Remove a pending (downloading/failed) instance directory."""
+        from shutil import rmtree
+        cfg = get_config()
+        inst_dir = cfg.inst_dir / name
+        if inst_dir.exists() and not (inst_dir / f"{name}.qcow2").exists():
+            rmtree(inst_dir, ignore_errors=True)
         self._trigger_refresh()
 
     def _on_create_done(self, result: dict[str, Any] | None) -> None:
@@ -1374,38 +1651,40 @@ class Dashboard(App):
             return
         recipe = result["recipe"]
         base_image = recipe.get("base_image", get_config().default_base_name)
-        if self._check_base_image(base_image):
+        cfg = get_config()
+        if (cfg.base_dir / base_image).exists():
             self._download_and_create(result)
             return
-        # Prompt to download
-        def _on_confirm(confirmed: bool) -> None:
-            if confirmed:
-                self._download_and_create(result)
-        self.push_screen(
-            ConfirmScreen(
-                f"Base image '{base_image}' not found. Download from catalog?",
-                _on_confirm,
-            )
-        )
+        in_catalog = any(v["filename"] == base_image for v in BASE_IMAGES.values())
+        if not in_catalog:
+            self.notify(f"Base image '{base_image}' not found and not in catalog", severity="error")
+            return
+
+        def _on_image_chosen(filename: str | None) -> None:
+            if filename:
+                self._download_and_create(result, base_image=filename)
+
+        self.push_screen(BaseImagePickerScreen(base_image, _on_image_chosen))
 
     def _on_run_done(self, result: dict[str, Any] | None) -> None:
         if result is None:
             return
         recipe = result["recipe"]
         base_image = recipe.get("base_image", get_config().default_base_name)
-        if self._check_base_image(base_image):
+        cfg = get_config()
+        if (cfg.base_dir / base_image).exists():
             self._download_and_create(result)
             return
-        # Prompt to download
-        def _on_confirm(confirmed: bool) -> None:
-            if confirmed:
-                self._download_and_create(result)
-        self.push_screen(
-            ConfirmScreen(
-                f"Base image '{base_image}' not found. Download from catalog?",
-                _on_confirm,
-            )
-        )
+        in_catalog = any(v["filename"] == base_image for v in BASE_IMAGES.values())
+        if not in_catalog:
+            self.notify(f"Base image '{base_image}' not found and not in catalog", severity="error")
+            return
+
+        def _on_image_chosen(filename: str | None) -> None:
+            if filename:
+                self._download_and_create(result, base_image=filename)
+
+        self.push_screen(BaseImagePickerScreen(base_image, _on_image_chosen))
 
     def _on_capsule_chosen(self, capsule_name: str | None) -> None:
         if capsule_name is None:
@@ -1413,10 +1692,19 @@ class Dashboard(App):
         name = self._selected_name()
         if not name:
             return
-        self._run_command(
-            lambda: (_ensure_running(name), apply_capsule_live(name, capsule_name))[1],
-            f"Apply capsule to {name}",
-        )
+        self._update_statusbar_msg(f"Applying {capsule_name} to {name}...")
+
+        def _apply() -> None:
+            try:
+                _ensure_running(name)
+                apply_capsule_live(name, capsule_name)
+                self.call_from_thread(lambda: self.notify(f"Applied {capsule_name} to {name}", severity="information"))
+            except Exception as exc:
+                self.call_from_thread(lambda: self.notify(f"Apply failed: {exc}", severity="error"))
+            finally:
+                self.call_from_thread(lambda: self._update_statusbar())
+
+        threading.Thread(target=_apply, daemon=True).start()
 
     # --- Global actions ------------------------------------------------------
 
@@ -1456,37 +1744,47 @@ class Dashboard(App):
 
     # --- VM actions ----------------------------------------------------------
 
+    def _run_vm_action(self, name: str, fn: Callable[[], Any], label: str) -> None:
+        """Run a VM action in a background thread with toast notifications."""
+        self._update_statusbar_msg(f"{label}...")
+        
+        def _do() -> None:
+            try:
+                fn()
+                self.call_from_thread(lambda: self.notify(f"{label} completed", severity="information"))
+                self.call_from_thread(self._trigger_refresh)
+            except Exception as exc:
+                self.call_from_thread(lambda: self.notify(f"{label} failed: {exc}", severity="error"))
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def action_start(self) -> None:
         name = self._selected_name()
         if not name:
             self.notify("Select a VM first", severity="warning")
             return
-        self._run_command(lambda: start_instance(name), f"Start {name}")
-        self._trigger_refresh()
+        self._run_vm_action(name, lambda: start_instance(name, wait=False), f"Start {name}")
 
     def action_stop(self) -> None:
         name = self._selected_name()
         if not name:
             self.notify("Select a VM first", severity="warning")
             return
-        self._run_command(lambda: stop_instance(name), f"Stop {name}")
-        self._trigger_refresh()
+        self._run_vm_action(name, lambda: stop_instance(name), f"Stop {name}")
 
     def action_pause(self) -> None:
         name = self._selected_name()
         if not name:
             self.notify("Select a VM first", severity="warning")
             return
-        self._run_command(lambda: pause_instance(name), f"Pause {name}")
-        self._trigger_refresh()
+        self._run_vm_action(name, lambda: pause_instance(name), f"Pause {name}")
 
     def action_resume(self) -> None:
         name = self._selected_name()
         if not name:
             self.notify("Select a VM first", severity="warning")
             return
-        self._run_command(lambda: resume_instance(name), f"Resume {name}")
-        self._trigger_refresh()
+        self._run_vm_action(name, lambda: resume_instance(name), f"Resume {name}")
 
     def action_destroy(self) -> None:
         name = self._selected_name()
@@ -1496,8 +1794,7 @@ class Dashboard(App):
 
         def _on_result(confirmed: bool) -> None:
             if confirmed:
-                self._run_command(lambda: destroy_instance(name), f"Destroy {name}")
-                self._trigger_refresh()
+                self._run_vm_action(name, lambda: destroy_instance(name), f"Destroy {name}")
 
         self.push_screen(TypeToConfirmScreen(f"Destroy VM '{name}' and shred its disk?", "destroy", _on_result))
 
@@ -1577,6 +1874,23 @@ class Dashboard(App):
             self.notify("Select a VM first", severity="warning")
             return
         self.push_screen(InfoScreen(vm))
+
+    def action_logs(self) -> None:
+        name = self._selected_name()
+        if not name:
+            self.notify("Select a VM first", severity="warning")
+            return
+        self._update_statusbar_msg(f"Fetching logs for {name}...")
+
+        def _fetch() -> None:
+            log = fetch_vm_error_log(name)
+            self.call_from_thread(lambda: self._show_logs(name, log))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _show_logs(self, name: str, log: str) -> None:
+        self._update_statusbar()
+        self.push_screen(LogsScreen(name, log))
 
     def _selected_name(self) -> str | None:
         vm = self.selected_vm
